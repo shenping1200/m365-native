@@ -279,6 +279,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
+			RequestCount: s.accountStats[a.ID],
 		})
 	}
 	jsonOut(w, map[string]any{"accounts": out})
@@ -403,7 +404,13 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 	if accountID != "" {
-		return s.tokens.EnsureValid(accountID)
+		tok, err := s.tokens.EnsureValid(accountID)
+		if err == nil {
+			s.mu.Lock()
+			s.accountStats[accountID]++
+			s.mu.Unlock()
+		}
+		return tok, err
 	}
 	list := s.tokens.List()
 	if len(list) == 0 {
