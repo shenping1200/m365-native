@@ -4,6 +4,17 @@ M365 ChatHub gateway for **authorized Microsoft 365 Copilot sessions**. It expos
 
 > This project is an interoperability gateway, not an authentication bypass. You must use a Microsoft account and tenant you are authorized to use. Upstream model availability, quotas, tools, vision, and image generation depend on the account and Microsoft service.
 
+## 近期更新（2026-07-19 · 本 fork 增量）
+
+> 以下为 `shenping1200/m365-native` 相对上游的本地增量改动，便于在主页快速查看。
+
+- **多账号轮询**：`resolveAccount()` 改为 round-robin。请求未指定账号且无会话绑定时，依次轮流使用全部已登录账号，把请求量分散到多个账号，规避微软 ChatHub 的 per-account 限流。同一段对话（同一 `session_key`）内账号锁定为首次选中的账号，保证上下文连贯。
+- **删除账号**：账号池页面每一行新增「删除」按钮，调用 `POST /api/accounts/delete`（body `{"id":"..."}`）按 id 删除账号，操作不可撤销。
+- **每账号请求次数统计**：`Server` 新增 `accountStats map[string]int64`，`resolveAccount()` 在「指定账号」与「轮询」两条分支均计数；`/api/accounts` 每个账号返回 `requestCount`；前端账号池表格新增「请求次数」列（蓝色数字）。计数在内存中，服务/容器重启后归零。
+- **上下文连贯性说明**：轮询不会导致 AI 回答断片。同一段对话内账号被锁定；且 OpenAI 兼容客户端（`/v1/chat/completions`）每轮都会把完整 `messages` 历史拼进 prompt 发送，即使账号轮换模型也能看到全部历史。
+
+相关提交：`f9df1f7`（删除账号 + 轮询）、`523c482`（请求次数初版）、`db75611`（请求次数计数修复）。
+
 ## Reference repositories
 
 - **M365-Copilot2API:** <https://github.com/HEXUXIU/M365-Copilot2API>
