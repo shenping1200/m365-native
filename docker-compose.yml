@@ -4,7 +4,7 @@ services:
     image: m365-native:latest
     restart: unless-stopped
     ports:
-      - "127.0.0.1:4141:4141"
+      - "0.0.0.0:4141:4141"
     environment:
       M365_LISTEN: 0.0.0.0:4141
       M365_CONFIG: /data/accounts.json
@@ -16,3 +16,4 @@ services:
     volumes:
       - ./data:/data
       - ./secrets/m365_admin_password:/run/secrets/m365_admin_password:ro
+      - ./web:/app/web:ro

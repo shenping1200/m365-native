@@ -26,6 +26,7 @@ type pendingPKCE struct {
 
 type Server struct {
 	mu                 sync.Mutex
+	accountIdx        int
 	tokens             *auth.Store
 	pkce               map[string]pendingPKCE
 	chat               *chathub.Client
@@ -172,7 +173,7 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.adminSessions[token] = time.Now().Add(24 * time.Hour)
 	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "m365_admin_session", Value: token, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+	http.SetCookie(w, &http.Cookie{Name: "m365_admin_session", Value: token, Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
 	jsonOut(w, map[string]any{"status": "authenticated", "must_change_password": mustChange})
 }
 func (s *Server) adminLogout(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +182,7 @@ func (s *Server) adminLogout(w http.ResponseWriter, r *http.Request) {
 		delete(s.adminSessions, c.Value)
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "m365_admin_session", Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: "m365_admin_session", Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	jsonOut(w, map[string]string{"status": "logged_out"})
 }
 func (s *Server) adminSession(w http.ResponseWriter, r *http.Request) {
@@ -398,14 +399,27 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
-	if accountID == "" {
-		acc, ok := s.tokens.First()
-		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
-		}
-		accountID = acc.ID
+	if accountID != "" {
+		return s.tokens.EnsureValid(accountID)
 	}
-	return s.tokens.EnsureValid(accountID)
+	list := s.tokens.List()
+	if len(list) == 0 {
+		return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+	}
+	s.mu.Lock()
+	start := s.accountIdx % len(list)
+	s.accountIdx++
+	s.mu.Unlock()
+	var lastErr error
+	for i := 0; i < len(list); i++ {
+		acc := list[(start+i)%len(list)]
+		tok, err := s.tokens.EnsureValid(acc.ID)
+		if err == nil {
+			return tok, nil
+		}
+		lastErr = err
+	}
+	return auth.AccountToken{}, lastErr
 }
 
 type chatBody struct {
