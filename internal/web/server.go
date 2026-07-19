@@ -38,6 +38,7 @@ type Server struct {
 	apiKeys            *apiKeyStore
 	debug              *debugStore
 	settings           *settingsStore
+	accountStats       map[string]int64
 }
 
 func New() (*Server, error) {
@@ -58,6 +59,7 @@ func New() (*Server, error) {
 		apiKeys:            openAPIKeys(),
 		debug:              openDebugStore(),
 		settings:           openSettingsStore(),
+		accountStats:       make(map[string]int64),
 	}, nil
 }
 
@@ -269,6 +271,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		TID         string    `json:"tid,omitempty"`
 		ExpiresAt   time.Time `json:"expiresAt,omitempty"`
 		UpdatedAt   time.Time `json:"updatedAt,omitempty"`
+		RequestCount  int64     `json:"requestCount"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
@@ -415,6 +418,9 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		acc := list[(start+i)%len(list)]
 		tok, err := s.tokens.EnsureValid(acc.ID)
 		if err == nil {
+			s.mu.Lock()
+			s.accountStats[acc.ID]++
+			s.mu.Unlock()
 			return tok, nil
 		}
 		lastErr = err
