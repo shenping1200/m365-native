@@ -87,3 +87,23 @@ func (s *sessionStore) delete(id string) bool {
 	s.saveLocked()
 	return true
 }
+
+// deleteByAccount removes every cached conversation bound to the given account
+// ID. Called when an account is deleted so stale session_key bindings don't keep
+// returning 400 and don't pin a chat to a dead account (which would otherwise
+// disable round-robin failover for that session).
+func (s *sessionStore) deleteByAccount(accountID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for k, v := range s.data {
+		if v.AccountID == accountID {
+			delete(s.data, k)
+			removed++
+		}
+	}
+	if removed > 0 {
+		s.saveLocked()
+	}
+	return removed
+}

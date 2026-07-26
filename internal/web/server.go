@@ -202,6 +202,7 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var b struct {
 			Name string `json:"name"`
+			Days int    `json:"days"`
 		}
 		if json.NewDecoder(r.Body).Decode(&b) != nil {
 			http.Error(w, "bad json", 400)
@@ -210,12 +211,26 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(b.Name) == "" {
 			b.Name = "API key"
 		}
-		rec, raw, e := s.apiKeys.create(b.Name)
+		rec, raw, e := s.apiKeys.create(b.Name, b.Days)
 		if e != nil {
 			http.Error(w, e.Error(), 500)
 			return
 		}
 		jsonOut(w, map[string]any{"key": raw, "record": rec})
+	case http.MethodPatch:
+		var b struct {
+			ID   string `json:"id"`
+			Days int    `json:"days"`
+		}
+		if json.NewDecoder(r.Body).Decode(&b) != nil || b.ID == "" {
+			http.Error(w, "bad json", 400)
+			return
+		}
+		if !s.apiKeys.setExpiry(b.ID, b.Days) {
+			http.Error(w, "key not found", 404)
+			return
+		}
+		jsonOut(w, map[string]string{"status": "updated"})
 	case http.MethodDelete:
 		id := r.URL.Query().Get("id")
 		if !s.apiKeys.revoke(id) {
@@ -279,10 +294,19 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
-			RequestCount: s.accountStats[a.ID],
+			RequestCount: s.accountRequestCount(a.ID),
 		})
 	}
 	jsonOut(w, map[string]any{"accounts": out})
+}
+
+// accountRequestCount returns the per-account request counter under the server
+// lock. Reading accountStats without the lock races with the write in
+// resolveAccount and triggers Go's fatal "concurrent map read and map write".
+func (s *Server) accountRequestCount(id string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accountStats[id]
 }
 
 func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -324,7 +348,8 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonOut(w, map[string]string{"status": "deleted"})
+	removed := s.sessions.deleteByAccount(body.ID)
+	jsonOut(w, map[string]any{"status": "deleted", "sessionsRemoved": removed})
 }
 
 func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {

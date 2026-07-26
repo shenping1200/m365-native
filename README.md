@@ -4,16 +4,25 @@ M365 ChatHub gateway for **authorized Microsoft 365 Copilot sessions**. It expos
 
 > This project is an interoperability gateway, not an authentication bypass. You must use a Microsoft account and tenant you are authorized to use. Upstream model availability, quotas, tools, vision, and image generation depend on the account and Microsoft service.
 
-## 近期更新（2026-07-19 · 本 fork 增量）
+## 近期更新（2026-07-26 · 本 fork 增量）
 
 > 以下为 `shenping1200/m365-native` 相对上游的本地增量改动，便于在主页快速查看。
 
+### 2026-07-19
 - **多账号轮询**：`resolveAccount()` 改为 round-robin。请求未指定账号且无会话绑定时，依次轮流使用全部已登录账号，把请求量分散到多个账号，规避微软 ChatHub 的 per-account 限流。同一段对话（同一 `session_key`）内账号锁定为首次选中的账号，保证上下文连贯。
 - **删除账号**：账号池页面每一行新增「删除」按钮，调用 `POST /api/accounts/delete`（body `{"id":"..."}`）按 id 删除账号，操作不可撤销。
 - **每账号请求次数统计**：`Server` 新增 `accountStats map[string]int64`，`resolveAccount()` 在「指定账号」与「轮询」两条分支均计数；`/api/accounts` 每个账号返回 `requestCount`；前端账号池表格新增「请求次数」列（蓝色数字）。计数在内存中，服务/容器重启后归零。
 - **上下文连贯性说明**：轮询不会导致 AI 回答断片。同一段对话内账号被锁定；且 OpenAI 兼容客户端（`/v1/chat/completions`）每轮都会把完整 `messages` 历史拼进 prompt 发送，即使账号轮换模型也能看到全部历史。
 
 相关提交：`f9df1f7`（删除账号 + 轮询）、`523c482`（请求次数初版）、`db75611`（请求次数计数修复）。
+
+### 2026-07-26
+- **并发安全修复（P0 #3）**：`/api/accounts` 读取每账号请求计数 `accountStats` 改为在 `Server` 锁内读取（新增 `accountRequestCount` 方法），消除与 `resolveAccount` 写计数之间的并发 map 读写，避免进程触发 `fatal error: concurrent map read and map write` 后崩溃。
+- **删除账号清理会话绑定（P0 #4）**：`deleteAccount` 在删除令牌的同时调用 `sessions.deleteByAccount(id)`，一并清除该账号绑定的所有 `session_key` 映射。修复「删除账号后带该 `session_key` 的会话永久返回 400」以及「删账号后废掉多账号轮询故障转移」两个问题。
+- **API Key 有效期**：创建密钥时支持「永久有效」或「自定义天数」（创建框新增单选项，`POST /api/admin/keys` 传 `days`，`days≤0` 为永久）；密钥列表新增「有效期」列（显示「永久有效」/ 过期时间 /「已过期」），并提供「改有效期」按钮（调用 `PATCH /api/admin/keys`，body `{"id":"...","days":N}`，`days≤0` 表示改回永久）。过期的密钥在调用任何 `/v1/*` 接口时返回 `401`。
+- **说明**：以上改动全部只在本 fork 维护，不向上游合并；上游设置不理想，所有更新/拉取均走本 fork。
+
+相关提交：本 fork 最新提交（2026-07-26 增量：并发安全 + 删账号清会话 + API Key 有效期）。
 
 ## Reference repositories
 

@@ -19,6 +19,7 @@ type apiKeyRecord struct {
 	Hash       string     `json:"hash"`
 	CreatedAt  time.Time  `json:"createdAt"`
 	LastUsedAt *time.Time `json:"lastUsedAt,omitempty"`
+	ExpiresAt  *time.Time `json:"expiresAt,omitempty"`
 	Revoked    bool       `json:"revoked"`
 }
 type apiKeyStore struct {
@@ -46,13 +47,17 @@ func (s *apiKeyStore) save() {
 	_ = os.WriteFile(s.Path, b, 0600)
 }
 func keyHash(k string) string { h := sha256.Sum256([]byte(k)); return hex.EncodeToString(h[:]) }
-func (s *apiKeyStore) create(name string) (apiKeyRecord, string, error) {
+func (s *apiKeyStore) create(name string, days int) (apiKeyRecord, string, error) {
 	b := make([]byte, 32)
 	if _, e := rand.Read(b); e != nil {
 		return apiKeyRecord{}, "", e
 	}
 	raw := "m365_" + hex.EncodeToString(b)
 	r := apiKeyRecord{ID: hex.EncodeToString(b[:8]), Name: name, Prefix: raw[:12], Hash: keyHash(raw), CreatedAt: time.Now()}
+	if days > 0 {
+		exp := time.Now().AddDate(0, 0, days)
+		r.ExpiresAt = &exp
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Keys = append(s.Keys, r)
@@ -85,10 +90,31 @@ func (s *apiKeyStore) valid(raw string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h := keyHash(raw)
+	now := time.Now()
 	for i := range s.Keys {
 		if s.Keys[i].Hash == h && !s.Keys[i].Revoked {
-			now := time.Now()
+			if s.Keys[i].ExpiresAt != nil && now.After(*s.Keys[i].ExpiresAt) {
+				// expired key: not valid, but keep the record visible in the UI
+				continue
+			}
 			s.Keys[i].LastUsedAt = &now
+			s.save()
+			return true
+		}
+	}
+	return false
+}
+func (s *apiKeyStore) setExpiry(id string, days int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.Keys {
+		if s.Keys[i].ID == id {
+			if days > 0 {
+				exp := time.Now().AddDate(0, 0, days)
+				s.Keys[i].ExpiresAt = &exp
+			} else {
+				s.Keys[i].ExpiresAt = nil
+			}
 			s.save()
 			return true
 		}
