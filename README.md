@@ -50,7 +50,7 @@ M365 ChatHub gateway for **authorized Microsoft 365 Copilot sessions**. It expos
 ## Quick start: source build
 
 ```bash
-git clone https://github.com/uefi2333/m365-native.git
+git clone https://github.com/shenping1200/m365-native.git
 cd m365-native
 cp .env.example .env
 # Edit .env. Never commit real passwords or tokens.
