@@ -29,6 +29,14 @@ M365 ChatHub gateway for **authorized Microsoft 365 Copilot sessions**. It expos
 - **代理连通性测试**：账号行新增「测试」按钮，保存前即可调用 `POST /api/admin/test-proxy` 验证代理是否可用，并返回出口 IP 与延迟；格式错误在保存时即提示。
 - **安全加固**：新增 `.dockerignore`，避免 `secrets/`（管理员密码）、`data/`、`.env` 被打包进镜像层。
 
+### 2026-08-04（续：代理证书修复 + 汇总 + 批量检测 + 缓存）
+- **HTTPS 代理证书跳过（仅代理段）**：修复 `https://` 形式代理在 M365 报 `unexpected EOF` 的问题。根因＝该代理只接受 TLS 接入且自身证书已过期（2021），Go 默认对「连到代理」这段也做证书校验故失败。改为自建 `CONNECT` 隧道，仅对「连到代理」这一段 `InsecureSkipVerify`，目标站（Microsoft / ipify）仍走正常 TLS 校验。指纹浏览器能用的 HTTPS 代理现在也能用。
+- **请求次数汇总**：账号池最顶部新增「请求次数汇总」卡片，数值为所有账号 `accountStats` 求和；`/api/accounts` 返回 `totalRequestCount`。
+- **一键批量检测代理**：账号列表「代理」表头右侧新增「🔍 一键检测」按钮，调用 `POST /api/admin/test-all-proxies` 并发探测所有配置了代理的账号，返回每个账号的 `ok / ip / status / latencyMs`。前端在每行内联显示结果（成功＝绿勾 + 出口 IP + 延迟；失败＝红叉 + 错误原因），顶部横幅汇总「成功 N / 失败 M」，方便快速定位失效代理。
+- **前端根页面缓存修复**：`rootPage` 增加 `Cache-Control: no-cache`，强制浏览器每次校验最新 `index.html`，避免「改了前端但用户端仍显示旧页面」的误判。
+
+相关提交：`32163cc`（HTTPS 代理证书跳过 + 请求次数汇总 + 一键批量检测代理）、`441474c`（根页面 no-cache）。
+
 ## Reference repositories
 
 - **M365-Copilot2API:** <https://github.com/HEXUXIU/M365-Copilot2API>
