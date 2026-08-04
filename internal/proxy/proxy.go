@@ -42,7 +42,8 @@ type Config struct {
 }
 
 // Parse 识别以下格式：
-//   http(s)://[user:pass@]host:port
+//   http(s)://[user:pass@]host:port           (标准)
+//   http(s)://host:port:user:pass             (非标准, 部分代理服务商常用)
 //   socks5://[user:pass@]host:port          (标准)
 //   socks5://host:port:user:pass            (非标准, 部分代理服务商常用)
 //   socks5h://host:port                      (远程解析 DNS)
@@ -120,6 +121,12 @@ func parseAuthHostPort(c Config, rest string) (Config, error) {
 			c.User = authPart
 		}
 		return setHostPort(c, hp)
+	}
+	// 无 @: 支持非标准 4 段 host:port:user:pass (与 SOCKS 分支一致)。
+	// 例如 https://172.87.24.55:443:123:123
+	if parts := strings.Split(rest, ":"); len(parts) == 4 {
+		c.Host, c.Port, c.User, c.Pass = parts[0], parts[1], parts[2], parts[3]
+		return c, nil
 	}
 	return setHostPort(c, rest)
 }
