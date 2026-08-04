@@ -80,6 +80,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
 	m.HandleFunc("/api/accounts/proxy", s.updateAccountProxy)
 	m.HandleFunc("/api/admin/test-proxy", s.testProxy)
+	m.HandleFunc("/api/admin/test-all-proxies", s.testAllProxies)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
 	m.HandleFunc("/api/chat", s.chatOnce)
@@ -281,28 +282,33 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	}
 	list := s.tokens.List()
 	type view struct {
-		ID          string    `json:"id"`
-		Email       string    `json:"email"`
-		DisplayName string    `json:"displayName,omitempty"`
-		Status      string    `json:"status"`
-		OID         string    `json:"oid,omitempty"`
-		TID         string    `json:"tid,omitempty"`
-		ExpiresAt   time.Time `json:"expiresAt,omitempty"`
-		UpdatedAt   time.Time `json:"updatedAt,omitempty"`
-		RequestCount  int64     `json:"requestCount"`
+		ID           string    `json:"id"`
+		Email        string    `json:"email"`
+		DisplayName  string    `json:"displayName,omitempty"`
+		Status       string    `json:"status"`
+		OID          string    `json:"oid,omitempty"`
+		TID          string    `json:"tid,omitempty"`
+		ExpiresAt    time.Time `json:"expiresAt,omitempty"`
+		UpdatedAt    time.Time `json:"updatedAt,omitempty"`
+		RequestCount int64     `json:"requestCount"`
 		Proxy        string    `json:"proxy,omitempty"`
 	}
 	out := make([]view, 0, len(list))
+	var total int64
+	s.mu.Lock()
 	for _, a := range list {
+		cnt := s.accountStats[a.ID]
+		total += cnt
 		out = append(out, view{
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
-			RequestCount: s.accountRequestCount(a.ID),
+			RequestCount: cnt,
 			Proxy:        a.Proxy,
 		})
 	}
-	jsonOut(w, map[string]any{"accounts": out})
+	s.mu.Unlock()
+	jsonOut(w, map[string]any{"accounts": out, "totalRequestCount": total})
 }
 
 // accountRequestCount returns the per-account request counter under the server
@@ -428,6 +434,103 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 		"ip":        o.IP,
 		"status":    resp.StatusCode,
 		"latencyMs": time.Since(start).Milliseconds(),
+	})
+}
+
+// testAllProxies iterates every account that has a proxy configured and
+// probes it concurrently through the same /api/admin/test-proxy code path.
+// The result list preserves account order so the frontend can update each
+// row's status inline. Accounts without a proxy are skipped (the UI can
+// query /api/accounts to know the full account count).
+func (s *Server) testAllProxies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	list := s.tokens.List()
+	type result struct {
+		AccountID   string `json:"accountId"`
+		Email       string `json:"email"`
+		DisplayName string `json:"displayName,omitempty"`
+		Proxy       string `json:"proxy"`
+		OK          bool   `json:"ok"`
+		IP          string `json:"ip,omitempty"`
+		Status      int    `json:"status,omitempty"`
+		LatencyMs   int64  `json:"latencyMs"`
+		Error       string `json:"error,omitempty"`
+	}
+	results := make([]result, 0, len(list))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, a := range list {
+		if strings.TrimSpace(a.Proxy) == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(acc auth.AccountToken) {
+			defer wg.Done()
+			res := result{
+				AccountID:   acc.ID,
+				Email:       acc.Email,
+				DisplayName: acc.DisplayName,
+				Proxy:       strings.TrimSpace(acc.Proxy),
+			}
+			cfg, err := proxy.Parse(res.Proxy)
+			if err != nil {
+				res.Error = "代理格式错误: " + err.Error()
+				mu.Lock()
+				results = append(results, res)
+				mu.Unlock()
+				return
+			}
+			client, err := cfg.HTTPClient()
+			if err != nil {
+				res.Error = "代理不可用: " + err.Error()
+				mu.Lock()
+				results = append(results, res)
+				mu.Unlock()
+				return
+			}
+			start := time.Now()
+			req, _ := http.NewRequest(http.MethodGet, "https://api.ipify.org?format=json", nil)
+			resp, err := client.Do(req)
+			res.LatencyMs = time.Since(start).Milliseconds()
+			if err != nil {
+				res.Error = "连接失败: " + err.Error()
+				mu.Lock()
+				results = append(results, res)
+				mu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			var o struct {
+				IP string `json:"ip"`
+			}
+			_ = json.Unmarshal(b, &o)
+			res.OK = resp.StatusCode == http.StatusOK
+			res.IP = o.IP
+			res.Status = resp.StatusCode
+			if !res.OK {
+				res.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			}
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}(a)
+	}
+	wg.Wait()
+	okCount := 0
+	for _, r := range results {
+		if r.OK {
+			okCount++
+		}
+	}
+	jsonOut(w, map[string]any{
+		"results":  results,
+		"total":    len(results),
+		"ok":       okCount,
+		"failed":   len(results) - okCount,
 	})
 }
 

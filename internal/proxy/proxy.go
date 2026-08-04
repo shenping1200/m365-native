@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,12 +25,20 @@ const (
 )
 
 type Config struct {
-	Raw  string
-	Type Kind
-	Host string
-	Port string
-	User string
-	Pass string
+	Raw    string
+	Type   Kind
+	Host   string
+	Port   string
+	User   string
+	Pass   string
+	// UseTLS is true when the user wrote `https://` for the proxy URL.
+	// Many proxy providers label their service as "HTTPS" while the proxy
+	// itself accepts plain HTTP CONNECT — but real TLS-wrapped proxies do
+	// exist (e.g. 12.180.8.60:443). We honor the scheme so users can pick
+	// whichever the provider actually runs. This only affects how Go dials
+	// the proxy host; HTTP CONNECT itself is sent as plaintext in both
+	// cases, then TLS is layered on top for the target host.
+	UseTLS bool
 }
 
 // Parse 识别以下格式：
@@ -50,8 +60,13 @@ func Parse(raw string) (Config, error) {
 		scheme := low[:i]
 		rest := raw[i+3:]
 		switch scheme {
-		case "http", "https":
+		case "http":
 			c.Type = KindHTTP
+			c.UseTLS = false
+			return parseAuthHostPort(c, rest)
+		case "https":
+			c.Type = KindHTTP
+			c.UseTLS = true
 			return parseAuthHostPort(c, rest)
 		case "socks5", "socks5h":
 			c.Type = KindSOCKS5
@@ -124,6 +139,74 @@ func setHostPort(c Config, hp string) (Config, error) {
 
 func (c Config) addr() string { return net.JoinHostPort(c.Host, c.Port) }
 
+// proxyURL builds the URL Go's http transport / gorilla dialer uses to reach
+// the proxy. The scheme follows the user's input: http:// → plaintext dial
+// (CONNECT in HTTP), https:// → TLS dial (CONNECT over TLS). Real-world
+// "HTTPS" proxies that listen on TCP/443 with TLS to the client honor this;
+// providers that just label their CONNECT endpoint "HTTPS" should be entered
+// as http:// instead.
+func (c Config) proxyURL() *url.URL {
+	u := url.URL{Scheme: "http", Host: c.addr()}
+	if c.UseTLS {
+		u.Scheme = "https"
+	}
+	if c.User != "" {
+		u.User = url.UserPassword(c.User, c.Pass)
+	}
+	return &u
+}
+
+// tunnelDialContext opens a connection to the *target* addr by first
+// establishing a tunnel through the HTTP/HTTPS proxy. The proxy connection is
+// dialed with InsecureSkipVerify (we trust the user's proxy cert, expired or
+// self-signed — matching how fingerprint browsers behave); the target host's
+// own TLS is negotiated on top of the tunnel and verified by the caller's
+// transport/dialer config.
+func (c Config) tunnelDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+	proxyAddr := c.addr()
+	if c.UseTLS {
+		d := tls.Dialer{
+			NetDialer: &net.Dialer{},
+			Config:    &tls.Config{InsecureSkipVerify: true},
+		}
+		conn, err = d.DialContext(ctx, "tcp", proxyAddr)
+	} else {
+		var d net.Dialer
+		conn, err = d.DialContext(ctx, "tcp", proxyAddr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("连接代理 %s 失败: %w", proxyAddr, err)
+	}
+
+	// Send HTTP CONNECT to the proxy.
+	req, err := http.NewRequest(http.MethodConnect, "http://"+addr, nil)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if c.User != "" {
+		req.SetBasicAuth(c.User, c.Pass)
+	}
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("写入代理 CONNECT 失败: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("读取代理响应失败: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("代理拒绝 CONNECT: %s", resp.Status)
+	}
+	return conn, nil
+}
+
 func (c Config) socksAuth() *proxy.Auth {
 	if c.User == "" {
 		return nil
@@ -138,13 +221,18 @@ func (c Config) HTTPClient() (*http.Client, error) {
 	}
 	switch c.Type {
 	case KindHTTP:
-		u := url.URL{Scheme: "http", Host: c.addr()}
-		if c.User != "" {
-			u.User = url.UserPassword(c.User, c.Pass)
-		}
+		// Tunnel through the proxy via a custom DialContext. The proxy leg
+		// is dialed with InsecureSkipVerify (fingerprint browsers do the same
+		// — they trust the user's proxy cert, even if it's self-signed or
+		// expired). The target host's TLS is still verified normally by the
+		// transport's default TLSClientConfig.
 		return &http.Client{
-			Transport: &http.Transport{Proxy: http.ProxyURL(&u)},
-			Timeout:   30 * time.Second,
+			Transport: &http.Transport{
+				DialContext:       c.tunnelDialContext,
+				Proxy:             nil,
+				DisableKeepAlives: false,
+			},
+			Timeout: 30 * time.Second,
 		}, nil
 	case KindSOCKS5, KindSOCKS4:
 		d, err := proxy.SOCKS5("tcp", c.addr(), c.socksAuth(), proxy.Direct)
@@ -171,11 +259,11 @@ func (c Config) WebSocketDialer(base *websocket.Dialer) (*websocket.Dialer, erro
 	}
 	switch c.Type {
 	case KindHTTP:
-		u := url.URL{Scheme: "http", Host: c.addr()}
-		if c.User != "" {
-			u.User = url.UserPassword(c.User, c.Pass)
-		}
-		d.Proxy = http.ProxyURL(&u)
+		// Tunnel through the proxy ourselves (same as HTTPClient) so the
+		// proxy leg can use InsecureSkipVerify while the target WS TLS is
+		// still verified by gorilla. Clear d.Proxy to avoid double CONNECT.
+		d.Proxy = nil
+		d.NetDialContext = c.tunnelDialContext
 	case KindSOCKS5, KindSOCKS4:
 		sd, err := proxy.SOCKS5("tcp", c.addr(), c.socksAuth(), proxy.Direct)
 		if err != nil {
