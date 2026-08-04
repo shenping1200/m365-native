@@ -49,5 +49,6 @@ func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, name, st.ModTime(), f)
 }
