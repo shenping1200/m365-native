@@ -11,6 +11,7 @@ import (
 	"io"
 	"m365-native/internal/auth"
 	"m365-native/internal/chathub"
+	"m365-native/internal/proxy"
 	"net/http"
 	"strings"
 	"sync"
@@ -77,6 +78,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts", s.accounts)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
+	m.HandleFunc("/api/accounts/proxy", s.updateAccountProxy)
+	m.HandleFunc("/api/admin/test-proxy", s.testProxy)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
 	m.HandleFunc("/api/chat", s.chatOnce)
@@ -287,6 +290,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt   time.Time `json:"expiresAt,omitempty"`
 		UpdatedAt   time.Time `json:"updatedAt,omitempty"`
 		RequestCount  int64     `json:"requestCount"`
+		Proxy        string    `json:"proxy,omitempty"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
@@ -295,6 +299,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
 			RequestCount: s.accountRequestCount(a.ID),
+			Proxy:        a.Proxy,
 		})
 	}
 	jsonOut(w, map[string]any{"accounts": out})
@@ -350,6 +355,80 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	removed := s.sessions.deleteByAccount(body.ID)
 	jsonOut(w, map[string]any{"status": "deleted", "sessionsRemoved": removed})
+}
+
+func (s *Server) updateAccountProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		ID    string `json:"id"`
+		Proxy string `json:"proxy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	body.Proxy = strings.TrimSpace(body.Proxy)
+	cfg, err := proxy.Parse(body.Proxy)
+	if err != nil {
+		http.Error(w, "代理格式错误: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.tokens.SetProxy(body.ID, cfg.Raw); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOut(w, map[string]any{"status": "ok", "proxy": cfg.Raw})
+}
+
+func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Proxy string `json:"proxy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	body.Proxy = strings.TrimSpace(body.Proxy)
+	cfg, err := proxy.Parse(body.Proxy)
+	if err != nil {
+		jsonOut(w, map[string]any{"ok": false, "error": "代理格式错误: " + err.Error()})
+		return
+	}
+	if cfg.Type == proxy.KindDirect {
+		jsonOut(w, map[string]any{"ok": true, "direct": true, "note": "直连(未配置代理)"})
+		return
+	}
+	client, err := cfg.HTTPClient()
+	if err != nil {
+		jsonOut(w, map[string]any{"ok": false, "error": "代理不可用: " + err.Error()})
+		return
+	}
+	start := time.Now()
+	req, _ := http.NewRequest(http.MethodGet, "https://api.ipify.org?format=json", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		jsonOut(w, map[string]any{"ok": false, "error": "连接失败: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var o struct {
+		IP string `json:"ip"`
+	}
+	_ = json.Unmarshal(b, &o)
+	jsonOut(w, map[string]any{
+		"ok":        resp.StatusCode == http.StatusOK,
+		"ip":        o.IP,
+		"status":    resp.StatusCode,
+		"latencyMs": time.Since(start).Milliseconds(),
+	})
 }
 
 func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
@@ -558,6 +637,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		AccessToken: acc.AccessToken,
 		OID:         acc.OID,
 		TID:         acc.TID,
+		Proxy:       acc.Proxy,
 	}, chathub.Request{
 		Text:           text,
 		Tone:           body.Tone,
@@ -749,7 +829,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
-	account := chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
+	account := chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID, Proxy: acc.Proxy}
 	// The stream is opened by the actual response path below. Do not emit a
 	// tool preamble here: a request may contain tools in its schema while still
 	// being an ordinary text question.

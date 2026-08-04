@@ -1,0 +1,14 @@
+data/
+secrets/
+.env
+.env.*
+!.env.example
+*.log
+.git/
+debug-logs.jsonl
+server
+m365-native
+m365-native.next
+m365-native.service
+m365-native.rollback*
+runtime.pid

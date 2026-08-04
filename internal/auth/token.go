@@ -48,25 +48,28 @@ func ExchangeCode(code, verifier, redirect string) (TokenSet, error) {
 	form.Set("redirect_uri", redirect)
 	form.Set("code_verifier", verifier)
 	form.Set("scope", Scope())
-	return requestToken(form)
+	return requestToken(form, nil)
 }
 
-func Refresh(refreshToken string) (TokenSet, error) {
+func Refresh(refreshToken string, client *http.Client) (TokenSet, error) {
 	form := url.Values{}
 	form.Set("client_id", ClientID())
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 	form.Set("scope", Scope())
-	return requestToken(form)
+	return requestToken(form, client)
 }
 
-func requestToken(form url.Values) (TokenSet, error) {
+func requestToken(form url.Values, client *http.Client) (TokenSet, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	req, err := http.NewRequest(http.MethodPost, TokenEndpoint(), strings.NewReader(form.Encode()))
 	if err != nil {
 		return TokenSet{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return TokenSet{}, err
 	}

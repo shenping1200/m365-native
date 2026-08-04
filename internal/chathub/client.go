@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"m365-native/internal/proxy"
 )
 
 const (
@@ -26,6 +27,7 @@ type Account struct {
 	AccessToken string
 	OID         string
 	TID         string
+	Proxy       string
 }
 
 type Request struct {
@@ -138,7 +140,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return Result{}, err
 	}
 
-	conn, _, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+	dialer, err := proxy.WebSocketDialerFor(c.Dialer, acc.Proxy)
+	if err != nil {
+		return Result{}, fmt.Errorf("proxy dialer: %w", err)
+	}
+	conn, _, err := dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
 	if err != nil {
 		return Result{}, fmt.Errorf("ws dial: %w", err)
 	}

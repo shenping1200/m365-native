@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"m365-native/internal/proxy"
 )
 
 type AccountToken struct {
@@ -21,6 +23,7 @@ type AccountToken struct {
 	OID          string    `json:"oid,omitempty"`
 	TID          string    `json:"tid,omitempty"`
 	ClientID     string    `json:"clientId,omitempty"`
+	Proxy        string    `json:"proxy,omitempty"`
 }
 
 type Cache struct {
@@ -127,16 +130,20 @@ func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 	found := false
 	for i, existing := range s.data.Accounts {
 		if existing.ID == acc.ID || (acc.Email != "" && existing.Email == acc.Email) {
-			if acc.RefreshToken == "" {
-				acc.RefreshToken = existing.RefreshToken
-			}
-			if acc.TID == "" {
-				acc.TID = existing.TID
-			}
-			if acc.OID == "" {
-				acc.OID = existing.OID
-			}
-			s.data.Accounts[i] = acc
+		if acc.RefreshToken == "" {
+			acc.RefreshToken = existing.RefreshToken
+		}
+		if acc.TID == "" {
+			acc.TID = existing.TID
+		}
+		if acc.OID == "" {
+			acc.OID = existing.OID
+		}
+		// OAuth 登录流程不带 proxy, 保留用户在 Web 界面手动设置的代理
+		if acc.Proxy == "" {
+			acc.Proxy = existing.Proxy
+		}
+		s.data.Accounts[i] = acc
 			found = true
 			break
 		}
@@ -158,6 +165,18 @@ func (s *Store) Delete(id string) error {
 	}
 	s.data.Accounts = next
 	return s.saveLocked()
+}
+
+func (s *Store) SetProxy(id, proxy string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Accounts {
+		if s.data.Accounts[i].ID == id {
+			s.data.Accounts[i].Proxy = proxy
+			return s.saveLocked()
+		}
+	}
+	return os.ErrNotExist
 }
 
 func (s *Store) Get(id string) (AccountToken, bool) {
@@ -201,7 +220,11 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 		s.mu.Unlock()
 		return acc, fmtExpired()
 	}
-	tok, err := Refresh(acc.RefreshToken)
+	client, err := proxy.HTTPClientFor(acc.Proxy)
+	if err != nil {
+		return acc, err
+	}
+	tok, err := Refresh(acc.RefreshToken, client)
 	if err != nil {
 		acc.Status = "expired"
 		s.mu.Lock()

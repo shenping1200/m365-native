@@ -24,6 +24,11 @@ M365 ChatHub gateway for **authorized Microsoft 365 Copilot sessions**. It expos
 
 相关提交：本 fork 最新提交（2026-07-26 增量：并发安全 + 删账号清会话 + API Key 有效期）。
 
+### 2026-08-04
+- **每账号独立代理**：账号池页面每个账号可单独配置代理。支持 `http(s)://host:port`、`socks5://user:pass@host:port`（标准）、`socks5://host:port:user:pass`（非标准，部分服务商常用）、`socks4://`、以及无 scheme 纯 `host:port`（默认按 SOCKS5）。ChatHub WebSocket 与该账号的 token 刷新均走对应代理，实现每账号独立出口 IP，进一步降低多账号被关联/触发风控的概率；未配置则直连。
+- **代理连通性测试**：账号行新增「测试」按钮，保存前即可调用 `POST /api/admin/test-proxy` 验证代理是否可用，并返回出口 IP 与延迟；格式错误在保存时即提示。
+- **安全加固**：新增 `.dockerignore`，避免 `secrets/`（管理员密码）、`data/`、`.env` 被打包进镜像层。
+
 ## Reference repositories
 
 - **M365-Copilot2API:** <https://github.com/HEXUXIU/M365-Copilot2API>
