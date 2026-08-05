@@ -2,8 +2,8 @@ package web
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +20,30 @@ func openAIChoice(v map[string]any) (map[string]any, string) {
 	return m, finish
 }
 
+// contentText extracts plain text from either a plain string or a content
+// parts array (text/input_text/output_text parts). Go map dumps must never
+// leak into client-visible responses.
+func contentText(c any) string {
+	switch v := c.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, part := range v {
+			if m, ok := part.(map[string]any); ok {
+				if t, _ := m["type"].(string); t == "text" || t == "input_text" || t == "output_text" {
+					if s, _ := m["text"].(string); s != "" {
+						b.WriteString(s)
+					}
+				}
+			}
+		}
+		return b.String()
+	default:
+		return ""
+	}
+}
+
 func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
 	id := "resp_" + uuid.NewString()
 	msg, _ := openAIChoice(src)
@@ -34,7 +58,7 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "arguments": fn["arguments"], "status": "completed"})
 		}
 	} else {
-		text, _ := msg["content"].(string)
+		text := contentText(msg["content"])
 		messageID := "msg_" + uuid.NewString()
 		output = append(output, map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}})
 	}
@@ -84,6 +108,40 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
+// anthropicBlocksFromContent converts an OpenAI content value (plain string or
+// parts array) into Anthropic message blocks, preserving image parts so image
+// results are not lost on the Anthropic protocol.
+func anthropicBlocksFromContent(c any) []any {
+	var blocks []any
+	switch v := c.(type) {
+	case string:
+		if v != "" {
+			blocks = append(blocks, map[string]any{"type": "text", "text": v})
+		}
+	case []any:
+		for _, part := range v {
+			m, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			t, _ := m["type"].(string)
+			switch t {
+			case "text", "input_text", "output_text":
+				if s, _ := m["text"].(string); s != "" {
+					blocks = append(blocks, map[string]any{"type": "text", "text": s})
+				}
+			case "image_url":
+				if u, _ := m["image_url"].(map[string]any); u != nil {
+					if s, _ := u["url"].(string); s != "" {
+						blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": s}})
+					}
+				}
+			}
+		}
+	}
+	return blocks
+}
+
 func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
 	id := "msg_" + uuid.NewString()
 	msg, finish := openAIChoice(src)
@@ -101,10 +159,11 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 			blocks = append(blocks, map[string]any{"type": "tool_use", "id": tc["id"], "name": fn["name"], "input": input})
 		}
 	} else {
-		blocks = append(blocks, map[string]any{"type": "text", "text": fmt.Sprint(msg["content"])})
+		blocks = anthropicBlocksFromContent(msg["content"])
 	}
 	_ = finish
-	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}, "m365": map[string]any{"usage_source": "unavailable_from_chathub", "usage_values_are_placeholders": true}}
+	usage := usageFromOpenAISource(src, outputTextOfBlocks(blocks))
+	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": usage, "m365": map[string]any{"usage_source": "estimated_by_gateway"}}
 	if !stream {
 		jsonOut(w, out)
 		return
@@ -117,7 +176,7 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 			f.Flush()
 		}
 	}
-	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
+	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": map[string]any{"input_tokens": usage["input_tokens"], "output_tokens": 0}}})
 	for i, b := range blocks {
 		m, _ := b.(map[string]any)
 		startBlock := b
@@ -133,6 +192,6 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 		}
 		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
-	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}})
+	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": usage["output_tokens"]}})
 	emit("message_stop", map[string]any{"type": "message_stop"})
 }

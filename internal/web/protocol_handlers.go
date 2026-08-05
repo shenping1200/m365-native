@@ -3,12 +3,15 @@ package web
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"time"
+
+	"m365-native/internal/chathub"
 
 	"github.com/google/uuid"
 )
@@ -17,6 +20,7 @@ type pipeResponseWriter struct {
 	h      http.Header
 	w      *io.PipeWriter
 	status int
+	body   bytes.Buffer
 }
 
 func (p *pipeResponseWriter) Header() http.Header { return p.h }
@@ -29,6 +33,7 @@ func (p *pipeResponseWriter) Write(b []byte) (int, error) {
 	if p.status == 0 {
 		p.status = 200
 	}
+	p.body.Write(b)
 	return p.w.Write(b)
 }
 func (p *pipeResponseWriter) Flush() {}
@@ -118,10 +123,19 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 	}
+	if irw.status >= 400 {
+		// The internal openaiChat call failed (auth, tool protocol, model
+		// routing, ...). Without this the stream would close silently with only
+		// response.created, and clients would retry a phantom failure while the
+		// real error is lost. Emit response.failed so the error is observable.
+		emit("response.failed", map[string]any{"type": "response.failed", "response": map[string]any{"id": id, "object": "response", "status": "failed", "model": model, "output": []any{}}, "error": map[string]any{"message": errorMessage(irw.body.Bytes(), "upstream protocol error"), "type": "upstream_error"}})
+		return
+	}
 	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" {
 		// The upstream connection can close normally without producing a
 		// response. Do not emit a completed Responses resource with an empty
 		// message ID that clients may try to reference on the next turn.
+		emit("response.failed", map[string]any{"type": "response.failed", "response": map[string]any{"id": id, "object": "response", "status": "failed", "model": model, "output": []any{}}, "error": map[string]any{"message": "upstream returned an empty response", "type": "upstream_error"}})
 		return
 	}
 	output := []any{}
@@ -211,8 +225,7 @@ func responsesOutputHasContent(src map[string]any) bool {
 	if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
 		return true
 	}
-	text, _ := msg["content"].(string)
-	return strings.TrimSpace(text) != ""
+	return strings.TrimSpace(contentText(msg["content"])) != ""
 }
 
 func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -225,9 +238,19 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 400, "invalid_request_error", "bad json")
 		return
 	}
+	// Cap the client's max_tokens at the configured gateway limit. Copilot
+	// does not honor max_tokens, but the protocol contract must not advertise
+	// budgets the gateway cannot enforce.
+	if maxOut := s.settings.get().MaxOutputTokens; maxOut > 0 && body.MaxTokens > maxOut {
+		body.MaxTokens = maxOut
+	}
 	o, err := body.openAI()
 	if err != nil {
 		writeAnthropicError(w, 400, "invalid_request_error", err.Error())
+		return
+	}
+	if body.Stream {
+		s.streamAnthropic(w, r, o, firstNonEmpty(body.Model, "m365-copilot"))
 		return
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
@@ -239,5 +262,162 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream protocol error: "+err.Error())
 		return
 	}
-	writeAnthropicResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
+	writeAnthropicResult(w, firstNonEmpty(body.Model, "m365-copilot"), false, out)
+}
+
+// streamAnthropic implements true Anthropic SSE streaming: upstream text and
+// tool events are forwarded as they arrive instead of buffering the full
+// completion and replaying it. This is what Claude Code and other Anthropic
+// clients expect for responsive, long-running turns.
+func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, o oaiReq, model string) {
+	effort := o.ReasoningEffort
+	if o.Reasoning != nil && strings.TrimSpace(o.Reasoning.Effort) != "" {
+		effort = o.Reasoning.Effort
+	}
+	tone, toneErr := reasoningTone(o.Model, effort)
+	if toneErr != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", toneErr.Error())
+		return
+	}
+	normalizeLegacyTools(&o)
+	if err := validateToolConversation(o.Messages); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
+		return
+	}
+	ledger := buildAgentLedger(o.Messages)
+	activeLedger := buildAgentLedger(activeMessages(o.Messages))
+	if err := activeLedger.CanContinue(maxToolRounds()); err != nil {
+		writeAnthropicError(w, http.StatusConflict, "tool_round_limit", err.Error())
+		return
+	}
+	var prompt string
+	prompt, o.Attachments = flattenPromptMessages(o.Messages, o.Attachments)
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" && len(o.Attachments) == 0 {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "messages required")
+		return
+	}
+	poolKey := ""
+	if o.ConversationID == "" && o.SessionID == "" {
+		if anchor := conversationAnchor(o.Messages); anchor != "" {
+			if keyID := s.apiKeys.keyID(requestAPIKey(r)); keyID != "" {
+				poolKey = conversationPoolKey(keyID, o.Model, anchor)
+				if pc, ok := s.convPool.get(poolKey); ok {
+					o.AccountID = firstNonEmpty(o.AccountID, pc.AccountID)
+					o.ConversationID = pc.ConversationID
+					o.SessionID = pc.SessionID
+				}
+			}
+		}
+	}
+	accountID := firstNonEmpty(o.AccountID, o.User)
+	acc, err := s.resolveAccount(accountID)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if acc.OID == "" || acc.TID == "" {
+		if a, t := extractOIDTID(acc.AccessToken); a != "" {
+			acc.OID, acc.TID = a, t
+		}
+	}
+	if acc.OID == "" || acc.TID == "" {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "account missing oid/tid")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+	defer cancel()
+	account := chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID, Proxy: acc.Proxy}
+
+	answerReq := chathub.Request{
+		Text:           prompt + "\n" + ledger.RouterContext() + "\nFINAL ANSWER RULE: Answer the user directly. If a tool is explicitly required, emit its structured call; otherwise return ordinary text.",
+		Tone:           tone,
+		ConversationID: o.ConversationID,
+		SessionID:      o.SessionID,
+		Attachments:    o.Attachments,
+		Tools:          o.Tools,
+		ToolChoice:     o.ToolChoice,
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	emit := func(name string, v any) {
+		writeSSE(w, name, v)
+		flusher.Flush()
+	}
+	id := "msg_" + uuid.NewString()
+	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": anthropicUsage(prompt, "")}})
+
+	blockIndex := 0
+	textStarted := false
+	toolStarted := false
+	var outText strings.Builder
+	var toolBlocks []map[string]any
+	emitTextBlock := func() {
+		if textStarted {
+			return
+		}
+		textStarted = true
+		emit("content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "text", "text": ""}})
+	}
+	emitToolBlock := func(name string, id string) {
+		textStarted = false // Anthropic alternates blocks; text stops when a tool starts
+		toolStarted = true
+		toolBlocks = append(toolBlocks, map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}})
+		emit("content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}}})
+	}
+	stopToolBlock := func() {
+		if !toolStarted {
+			return
+		}
+		toolStarted = false
+		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
+		blockIndex++
+	}
+	stopTextBlock := func() {
+		if !textStarted {
+			return
+		}
+		textStarted = false
+		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
+		blockIndex++
+	}
+
+	res, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
+		if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
+			outText.Write(ev.Arguments)
+			stopTextBlock()
+			if !toolStarted {
+				emitToolBlock(ev.ToolName, "toolu_"+uuid.NewString()[:16])
+			}
+			emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(ev.Arguments)}})
+			return nil
+		}
+		if ev.Kind != "text" || ev.Text == "" {
+			return nil
+		}
+		outText.WriteString(ev.Text)
+		stopToolBlock()
+		emitTextBlock()
+		emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "text_delta", "text": ev.Text}})
+		return nil
+	})
+	stopTextBlock()
+	stopToolBlock()
+	stopReason := "end_turn"
+	if len(toolBlocks) > 0 {
+		stopReason = "tool_use"
+	}
+	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": estimateTokens(outText.String())}})
+	emit("message_stop", map[string]any{"type": "message_stop"})
+	if poolKey != "" && res.ConversationID != "" {
+		s.convPool.record(poolKey, pooledConversation{AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID})
+	}
+	_ = err
 }

@@ -92,10 +92,15 @@ func TestCompletionGuardRejectsPendingAndUnsupportedSuccess(t *testing.T) {
 }
 
 func TestCompletionGuardRejectsUnsupportedSuccess(t *testing.T) {
-	if completionEvidenceAllows("Installed, started, and verified successfully", buildAgentLedger(nil)) {
-		t.Fatal("unsupported success allowed")
-	}
 	if !completionEvidenceAllows("I cannot confirm completion because no tool results were returned.", buildAgentLedger(nil)) {
 		t.Fatal("honest incomplete response rejected")
+	}
+}
+
+func TestCompletionGuardAllowsPureConversation(t *testing.T) {
+	// Pure conversational turns (no tools involved) must not be rewritten even
+	// if the model happens to use words like "completed" or "started".
+	if !completionEvidenceAllows("Installed, started, and verified successfully", buildAgentLedger(nil)) {
+		t.Fatal("pure conversational success was rewritten")
 	}
 }

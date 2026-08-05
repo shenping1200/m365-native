@@ -56,10 +56,10 @@ func normalizeReasoningEffort(e string) (string, error) {
 		return "", nil
 	}
 	switch e {
-	case "none", "minimal", "low", "medium", "high", "xhigh":
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
 		return e, nil
 	}
-	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, or xhigh", e)
+	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, xhigh, or max", e)
 }
 func reasoningTone(model, effort string) (string, error) {
 	e, err := normalizeReasoningEffort(effort)
@@ -74,7 +74,11 @@ func reasoningTone(model, effort string) (string, error) {
 	if e == "" || e == "none" || e == "minimal" || e == "low" {
 		return base, nil
 	}
-	switch strings.ToLower(strings.TrimSpace(model)) {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(m, "claude") {
+		return "Claude_Sonnet_Reasoning", nil
+	}
+	switch m {
 	case "claude", "claude-sonnet":
 		return "Claude_Sonnet_Reasoning", nil
 	case "gpt-5.2":
@@ -101,7 +105,7 @@ func modelCatalog() []map[string]any {
 		modalities := []string{"text", "image"}
 		caps := map[string]any{
 			"chat_completions": true, "responses": true, "streaming": true,
-			"tools": true, "reasoning": true, "reasoning_efforts": []string{"none", "minimal", "low", "medium", "high", "xhigh"},
+			"tools": true, "reasoning": true, "reasoning_efforts": []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"},
 			"reasoning_mode": "gateway_tone_routing", "supports_tools": true, "tool_calls": true,
 			"function_calling": true, "supports_function_calling": true, "supports_vision": true,
 			"vision": true, "modalities": modalities, "input_modalities": modalities,

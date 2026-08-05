@@ -6,6 +6,24 @@ import (
 	"math"
 )
 
+// toolChoiceRequiresRouter reports whether a client-requested tool choice
+// demands the deterministic JSON router instead of letting the answer
+// stream emit tool events naturally (auto/none skip the router).
+func toolChoiceRequiresRouter(choice any) bool {
+	switch c := choice.(type) {
+	case string:
+		return c == "required"
+	case map[string]any:
+		if _, ok := c["function"]; ok {
+			return true
+		}
+		if _, ok := c["name"]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func toolFunction(name string, tools []map[string]any) map[string]any {
 	for _, t := range tools {
 		f, _ := t["function"].(map[string]any)

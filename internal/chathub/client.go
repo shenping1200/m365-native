@@ -1,9 +1,14 @@
 package chathub
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -89,6 +94,12 @@ func NewClient() *Client {
 	}
 }
 
+// HTTPClient returns the default outbound client used for attachment
+// uploads/fetches when no account proxy is configured.
+func (c *Client) HTTPClient() *http.Client {
+	return &http.Client{Timeout: 90 * time.Second}
+}
+
 func (c *Client) Chat(ctx context.Context, acc Account, req Request) (Result, error) {
 	return c.ChatWithDelta(ctx, acc, req, nil)
 }
@@ -118,7 +129,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	if acc.AccessToken == "" || acc.OID == "" || acc.TID == "" {
 		return Result{}, fmt.Errorf("missing access token / oid / tid")
 	}
-	if strings.TrimSpace(req.Text) == "" {
+	if strings.TrimSpace(req.Text) == "" && len(req.Attachments) == 0 {
 		return Result{}, fmt.Errorf("empty prompt")
 	}
 	if req.Tone == "" {
@@ -134,6 +145,14 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		firstTurn = true
 	}
 	requestID := uuid.NewString()
+
+	// Enterprise Copilot image input requires uploading image attachments
+	// first; the returned docId is carried as a message annotation. A failed
+	// upload (network, throttling, unsupported URL) falls back to the legacy
+	// imageUrl/imageBase64 injection below instead of failing the request.
+	if err := c.uploadAttachments(ctx, acc, req.ConversationID, req.Attachments); err != nil {
+		log.Printf("chathub upload attachment: %v", err)
+	}
 
 	wsURL, err := buildWSURL(acc, req.SessionID, req.ConversationID, requestID)
 	if err != nil {
@@ -325,7 +344,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					RawResult:      rawResult,
 					Events:         events,
 					Normalized:     NormalizeEvents(events),
-					Images:         imageURLs(events),
+					Images:         filterEchoedImages(imageURLs(events), req.Attachments),
 				}, nil
 			}
 		}
@@ -359,15 +378,245 @@ func buildWSURL(acc Account, sessionID, conversationID, requestID string) (strin
 	return u, nil
 }
 
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// uploadAttachments uploads image attachments to the enterprise Copilot
+// UploadFile endpoint and records the returned docId for message annotations.
+// Only image attachments with a real source are uploaded; failures are logged
+// and the attachment is left without DocID so the request can still proceed
+// through the legacy imageUrl/imageBase64 injection path.
+func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversationID string, attachments []Attachment) error {
+	for i := range attachments {
+		a := &attachments[i]
+		if a.Type != "image" {
+			continue
+		}
+		imageData := a.URL
+		if !strings.HasPrefix(imageData, "data:") {
+			client, err := proxy.HTTPClientFor(acc.Proxy)
+			if err != nil {
+				client = c.HTTPClient()
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
+			if err != nil {
+				log.Printf("[upload] fetch request error: %v", err)
+				continue
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("[upload] fetch error: %v", err)
+				continue
+			}
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+			resp.Body.Close()
+			if err != nil || resp.StatusCode != http.StatusOK {
+				log.Printf("[upload] fetch status/read: %d %v", resp.StatusCode, err)
+				continue
+			}
+			mimeType := resp.Header.Get("Content-Type")
+			if mimeType == "" {
+				mimeType = "image/png"
+			}
+			imageData = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(body)
+		}
+		comma := strings.IndexByte(imageData, ',')
+		if comma < 0 {
+			return fmt.Errorf("invalid image data URL")
+		}
+		encoded := imageData[comma+1:]
+		if !strings.Contains(strings.ToLower(imageData[:comma]), ";base64") {
+			return fmt.Errorf("image URL is not base64")
+		}
+		if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
+			return fmt.Errorf("decode image: %w", err)
+		}
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		_ = mw.WriteField("scenario", "UploadImage")
+		_ = mw.WriteField("conversationId", conversationID)
+		// The browser sends the complete data URL in FileBase64, including the
+		// media-type prefix. UploadFile accepts this form and returns docId.
+		_ = mw.WriteField("FileBase64", imageData)
+		_ = mw.WriteField("optionsSets", "cwcgptvsan")
+		_ = mw.WriteField("optionsSets", "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch")
+		_ = mw.WriteField("optionsSets", "gptvnorm2048")
+		if err := mw.Close(); err != nil {
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://substrate.office.com/m365Copilot/UploadFile", &body)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		if acc.AccessToken != "" {
+			req.Header.Set("Authorization", "Bearer "+acc.AccessToken)
+		}
+		req.Header.Set("Accept", "application/json")
+		// Required by the enterprise Copilot UploadFile image-input path.
+		req.Header.Set("X-Variants", "feature.EnableImageSupportInUploadFile")
+		req.Header.Set("X-Scenario", "OfficeWebIncludedCopilot")
+		if acc.OID != "" && acc.TID != "" {
+			req.Header.Set("X-AnchorMailbox", "Oid:"+acc.OID+"@"+acc.TID)
+		}
+		for k, vv := range c.HTTPHeader {
+			for _, v := range vv {
+				if k != "Origin" || v != "" {
+					req.Header.Add(k, v)
+				}
+			}
+		}
+		client, err := proxy.HTTPClientFor(acc.Proxy)
+		if err != nil {
+			client = c.HTTPClient()
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[upload] http error: %v", err)
+			continue
+		}
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		resp.Body.Close()
+		if readErr != nil {
+			log.Printf("[upload] read error: %v", readErr)
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			log.Printf("[upload] status %s: %s", resp.Status, strings.TrimSpace(string(data[:minInt(len(data), 500)])))
+			continue
+		}
+		var out struct {
+			DocID    string `json:"docId"`
+			FileName string `json:"fileName"`
+			FileType string `json:"fileType"`
+			Result   struct {
+				Value string `json:"value"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(data, &out); err != nil {
+			log.Printf("[upload] json error: %v", err)
+			continue
+		}
+		if out.Result.Value != "Success" || out.DocID == "" {
+			log.Printf("[upload] failed: %s", strings.TrimSpace(string(data)))
+			continue
+		}
+		a.DocID = out.DocID
+		a.FileType = strings.TrimPrefix(strings.ToLower(out.FileType), ".")
+		// ChatHub's ImageFile annotation uses jpg for JPEG uploads.
+		if a.FileType == "jpeg" {
+			a.FileType = "jpg"
+		}
+		if a.Name == "" {
+			a.Name = out.FileName
+		}
+		log.Printf("[upload] success doc_id=%s file=%s type=%s", a.DocID, a.Name, a.FileType)
+	}
+	return nil
+}
+
+// filterEchoedImages drops URLs that were part of the request attachments:
+// ChatHub echoes the injected imageUrl back into update frames, and treating
+// that echo as an output image would corrupt text responses with image parts.
+func filterEchoedImages(images []string, attachments []Attachment) []string {
+	if len(attachments) == 0 {
+		return images
+	}
+	echoed := make(map[string]bool, len(attachments))
+	for _, a := range attachments {
+		if a.URL != "" {
+			echoed[a.URL] = true
+		}
+	}
+	out := images[:0]
+	for _, u := range images {
+		if !echoed[u] {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
 func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any) string {
 	text = toolProtocolPrompt(text, tools, toolChoice)
+	message := map[string]any{
+		"author":      "user",
+		"attachments": attachments,
+		"inputMethod": "Keyboard",
+		"text":        text,
+		"requestId":   requestID,
+		"locationInfo": map[string]any{
+			"timeZoneOffset": 8,
+			"timeZone":       "Asia/Shanghai",
+		},
+		"locale":         "en-US",
+		"messageType":    "Chat",
+		"experienceType": "Default",
+	}
+	// Uploaded images are referenced through the same ImageFile annotation the
+	// browser sends after the file has been uploaded by Office.
+	annotations := make([]any, 0, len(attachments))
+	for _, a := range attachments {
+		if a.Type != "image" || a.DocID == "" {
+			continue
+		}
+		if a.Name == "" {
+			a.Name = "image." + a.FileType
+		}
+		fileType := a.FileType
+		if fileType == "" {
+			fileType = strings.TrimPrefix(strings.ToLower(a.MimeType), "image/")
+		}
+		if fileType == "" || fileType == "image" || fileType == "*" {
+			fileType = "jpg"
+		}
+		annotations = append(annotations, map[string]any{
+			"id": a.DocID,
+			"messageAnnotationMetadata": map[string]any{
+				"@type": "File", "annotationType": "File",
+				"fileType": fileType, "fileName": a.Name,
+			},
+			"messageAnnotationType": "ImageFile",
+		})
+	}
+	if len(annotations) > 0 {
+		message["messageAnnotations"] = annotations
+		message["connectedFederatedConnections"] = []string{"dummyId"}
+	}
+	// Legacy multimodal injection: merge imageUrl/imageBase64 directly into
+	// message rather than relying solely on the attachments array. Copilot
+	// vision currently requires one of these two fields to see the image.
+	for _, a := range attachments {
+		if a.Type != "image" || a.URL == "" {
+			continue
+		}
+		if strings.HasPrefix(a.URL, "data:") {
+			if comma := strings.IndexByte(a.URL, ','); comma >= 0 && comma+1 < len(a.URL) {
+				message["imageBase64"] = a.URL[comma+1:]
+			}
+		} else {
+			message["imageUrl"] = a.URL
+		}
+		break
+	}
+	// Vision-related options sets mirrored from the verified browser flow.
+	optionsSets := []any{
+		"cwc_flux_image",
+		"flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+		"gptvnorm2048",
+		"cwc_fileupload_odb",
+	}
 	chat := map[string]any{
 		"arguments": []any{
 			map[string]any{
 				"source":              "officeweb",
 				"clientCorrelationId": uuid.NewString(),
 				"sessionId":           sessionID,
-				"optionsSets":         []any{},
+				"optionsSets":         optionsSets,
 				"options":             map[string]any{},
 				"allowedMessageTypes": []string{
 					"Chat", "EndOfRequest",
@@ -384,22 +633,9 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 				},
 				"tone":          tone,
 				"streamingMode": "ConciseWithPadding",
-				"message": map[string]any{
-					"author":      "user",
-					"attachments": attachments,
-					"inputMethod": "Keyboard",
-					"text":        text,
-					"requestId":   requestID,
-					"locationInfo": map[string]any{
-						"timeZoneOffset": 8,
-						"timeZone":       "Asia/Shanghai",
-					},
-					"locale":         "en-US",
-					"messageType":    "Chat",
-					"experienceType": "Default",
-				},
-				"plugins":    clientPlugins(tools),
-				"toolChoice": toolChoice,
+				"message":       message,
+				"plugins":       clientPlugins(tools),
+				"toolChoice":    toolChoice,
 			},
 		},
 		"invocationId": "0",

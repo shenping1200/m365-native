@@ -104,6 +104,18 @@ func (s *apiKeyStore) valid(raw string) bool {
 	}
 	return false
 }
+func (s *apiKeyStore) keyID(raw string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h := keyHash(raw)
+	for i := range s.Keys {
+		if s.Keys[i].Hash == h && !s.Keys[i].Revoked {
+			return s.Keys[i].ID
+		}
+	}
+	return ""
+}
+
 func (s *apiKeyStore) setExpiry(id string, days int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

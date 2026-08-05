@@ -19,7 +19,7 @@ func compatM365Metadata(res chathub.Result) map[string]any {
 		"conversationId": res.ConversationID,
 		"sessionId":      res.SessionID,
 		"requestId":      res.RequestID,
-		"usage_source":   "unavailable_from_chathub",
+		"usage_source":   "estimated_by_gateway",
 	}
 	if envTrue("M365_INCLUDE_UPSTREAM_EVENTS") {
 		m["events"] = res.Events

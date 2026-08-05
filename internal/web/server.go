@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"m365-native/internal/auth"
 	"m365-native/internal/chathub"
 	"m365-native/internal/proxy"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +30,7 @@ type pendingPKCE struct {
 
 type Server struct {
 	mu                 sync.Mutex
-	accountIdx        int
+	accountIdx         int
 	tokens             *auth.Store
 	pkce               map[string]pendingPKCE
 	chat               *chathub.Client
@@ -39,6 +42,7 @@ type Server struct {
 	apiKeys            *apiKeyStore
 	debug              *debugStore
 	settings           *settingsStore
+	convPool           *conversationPool
 	accountStats       map[string]int64
 }
 
@@ -48,7 +52,7 @@ func New() (*Server, error) {
 		return nil, err
 	}
 	password, mustChange := loadAdminPassword()
-	return &Server{
+	s := &Server{
 		tokens:             store,
 		pkce:               map[string]pendingPKCE{},
 		chat:               chathub.NewClient(),
@@ -60,8 +64,38 @@ func New() (*Server, error) {
 		apiKeys:            openAPIKeys(),
 		debug:              openDebugStore(),
 		settings:           openSettingsStore(),
+		convPool:           openConversationPool(),
 		accountStats:       make(map[string]int64),
-	}, nil
+	}
+	go s.autoRefreshAccounts()
+	return s, nil
+}
+
+// autoRefreshAccounts keeps the M365 account pool fresh. Access tokens expire
+// after roughly an hour; refreshing them lazily on the request path leaves a
+// window in which every account is expired at once and the channel returns
+// 503. A background loop refreshes tokens whose expiry is approaching so
+// requests never pay the refresh cost or hit an empty pool.
+func (s *Server) autoRefreshAccounts() {
+	interval := 2 * time.Minute
+	if v := os.Getenv("M365_REFRESH_INTERVAL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			interval = time.Duration(n) * time.Second
+		}
+	}
+	lead := 15 * time.Minute
+	if v := os.Getenv("M365_REFRESH_LEAD_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			lead = time.Duration(n) * time.Second
+		}
+	}
+	for {
+		time.Sleep(interval)
+		refreshed, failed := s.tokens.RefreshExpiring(lead)
+		if refreshed > 0 || failed > 0 {
+			log.Printf("[account-refresh] ok=%d failed=%d", refreshed, failed)
+		}
+	}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -93,7 +127,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/messages", s.anthropicMessages)
 	m.HandleFunc("/v1/images/generations", s.imageGenerations)
 	m.HandleFunc("/", s.rootPage)
-	return requestID(securityHeaders(s.adminMiddleware(s.debugMiddleware(m))))
+	return accessLog(requestID(securityHeaders(s.adminMiddleware(s.debugMiddleware(m)))))
 }
 
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {
@@ -246,7 +280,7 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 	}
 }
-func (s *Server) validAPIKey(r *http.Request) bool {
+func requestAPIKey(r *http.Request) string {
 	raw := strings.TrimSpace(r.Header.Get("X-API-Key"))
 	if raw == "" {
 		v := r.Header.Get("Authorization")
@@ -254,6 +288,11 @@ func (s *Server) validAPIKey(r *http.Request) bool {
 			raw = strings.TrimSpace(v[7:])
 		}
 	}
+	return raw
+}
+
+func (s *Server) validAPIKey(r *http.Request) bool {
+	raw := requestAPIKey(r)
 	return raw != "" && s.apiKeys.valid(raw)
 }
 
@@ -360,7 +399,8 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	removed := s.sessions.deleteByAccount(body.ID)
-	jsonOut(w, map[string]any{"status": "deleted", "sessionsRemoved": removed})
+	removedPool := s.convPool.deleteByAccount(body.ID)
+	jsonOut(w, map[string]any{"status": "deleted", "sessionsRemoved": removed, "poolRemoved": removedPool})
 }
 
 func (s *Server) updateAccountProxy(w http.ResponseWriter, r *http.Request) {
@@ -527,10 +567,10 @@ func (s *Server) testAllProxies(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	jsonOut(w, map[string]any{
-		"results":  results,
-		"total":    len(results),
-		"ok":       okCount,
-		"failed":   len(results) - okCount,
+		"results": results,
+		"total":   len(results),
+		"ok":      okCount,
+		"failed":  len(results) - okCount,
 	})
 }
 
@@ -678,9 +718,11 @@ func modelTone(model string) string {
 		return "Gpt_5_5_Reasoning"
 	case "gpt-5.6-reasoning":
 		return "Gpt_5_6_Reasoning"
-	case "claude", "claude-sonnet":
+	case "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol":
+		return "Gpt_5_6_Reasoning"
+	case "claude", "claude-sonnet", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929", "claude-sonnet-4.5":
 		return "Claude_Sonnet"
-	case "claude-sonnet-reasoning":
+	case "claude-sonnet-reasoning", "claude-sonnet-4-5-thinking", "claude-sonnet-4-5-20250929-thinking", "claude-sonnet-4.5-thinking":
 		return "Claude_Sonnet_Reasoning"
 	case "gpt-5.4-quick":
 		return "Gpt_5_4_Chat"
@@ -845,6 +887,17 @@ func normalizeLegacyTools(body *oaiReq) {
 	}
 }
 
+// buildAnswerPrompt appends the evidence ledger and final-answer rule only when
+// the conversation actually involves tools. Plain conversational turns must not
+// be polluted with agentic instructions (which make models answer with
+// "no tool actions were performed" boilerplate).
+func buildAnswerPrompt(prompt string, ledger agentLedger, hasTools bool) string {
+	if !hasTools && ledger.ToolRounds == 0 {
+		return prompt
+	}
+	return prompt + "\n" + ledger.RouterContext() + "\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed."
+}
+
 func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -902,6 +955,22 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
 		}
 	}
+	// Warm conversation reuse: pin the same Copilot conversation/account for
+	// subsequent turns of the same conversation (same key, model and opening
+	// user message) unless the client explicitly pinned a session.
+	poolKey := ""
+	if body.ConversationID == "" && body.SessionID == "" {
+		if anchor := conversationAnchor(body.Messages); anchor != "" {
+			if keyID := s.apiKeys.keyID(requestAPIKey(r)); keyID != "" {
+				poolKey = conversationPoolKey(keyID, body.Model, anchor)
+				if pc, ok := s.convPool.get(poolKey); ok {
+					body.AccountID = firstNonEmpty(body.AccountID, pc.AccountID)
+					body.ConversationID = pc.ConversationID
+					body.SessionID = pc.SessionID
+				}
+			}
+		}
+	}
 	accountID := firstNonEmpty(body.AccountID, body.User)
 	acc, err := s.resolveAccount(accountID)
 	if err != nil {
@@ -937,11 +1006,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// tool preamble here: a request may contain tools in its schema while still
 	// being an ordinary text question.
 	streamPrimed := false
-	// Streaming requests must not wait for the synchronous tool router. This
-	// path forwards ordinary upstream text deltas immediately; tool routing for
-	// non-streaming requests remains below until the event-level tool protocol
-	// is available end-to-end.
-	if body.Stream && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
+	// Streaming requests skip the synchronous tool router for tool_choice=auto:
+	// the answer stream already forwards upstream tool events (extractToolEvents)
+	// and text deltas in a single ChatHub round, so a separate router round only
+	// doubles latency (~5-9s) for no protocol benefit. The router is kept only
+	// when a deterministic structured call is mandatory (required/named choice).
+	if body.Stream && len(toolMaps) > 0 && toolChoiceRequiresRouter(body.ToolChoice) {
 		// Preserve the existing validated tool router for streaming tool turns.
 		// Only fall through to text streaming when the router explicitly selects
 		// no tool; this prevents a natural-language preamble from becoming a
@@ -968,7 +1038,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if body.SessionKey != "" {
 				s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: routeRes.ConversationID, SessionID: routeRes.SessionID, Title: prompt})
 			}
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, calls, routeRes)
+			if poolKey != "" && routeRes.ConversationID != "" {
+				s.convPool.record(poolKey, pooledConversation{AccountID: acc.ID, ConversationID: routeRes.ConversationID, SessionID: routeRes.SessionID})
+			}
+			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, calls, routeRes, prompt)
 			return
 		}
 	}
@@ -985,14 +1058,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		first := true
 		var streamedTools []detectedToolCall
-		_, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
+		var outText strings.Builder
+		res, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
+				outText.Write(ev.Arguments)
 				streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
 				return nil
 			}
 			if ev.Kind != "text" || ev.Text == "" {
 				return nil
 			}
+			outText.WriteString(ev.Text)
 			delta := map[string]any{"content": ev.Text}
 			if first {
 				delta["role"] = "assistant"
@@ -1009,8 +1085,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
 				flusher.Flush()
 			}
+			// OpenAI streaming clients and relays (new-api included) rely on a final
+			// chunk carrying usage; without it completions bill at 0 tokens.
+			usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{}, "usage": openAIUsage(prompt, outText.String())}
+			fmt.Fprintf(w, "data: %s\n\n", mustJSON(usageChunk))
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			flusher.Flush()
+		}
+		if poolKey != "" && res.ConversationID != "" {
+			s.convPool.record(poolKey, pooledConversation{AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID})
 		}
 		return
 	}
@@ -1041,7 +1124,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
 			calls = limitToolCalls(calls, configuredToolCallLimit(s.settings))
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, routeRes, streamPrimed)
+			if poolKey != "" && routeRes.ConversationID != "" {
+				s.convPool.record(poolKey, pooledConversation{AccountID: acc.ID, ConversationID: routeRes.ConversationID, SessionID: routeRes.SessionID})
+			}
+			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, routeRes, prompt, streamPrimed)
 			return
 		}
 		if fmt.Sprint(body.ToolChoice) == "required" {
@@ -1058,7 +1144,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
 					calls = limitToolCalls(calls, configuredToolCallLimit(s.settings))
-					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes, streamPrimed)
+					if poolKey != "" && retryRes.ConversationID != "" {
+						s.convPool.record(poolKey, pooledConversation{AccountID: acc.ID, ConversationID: retryRes.ConversationID, SessionID: retryRes.SessionID})
+					}
+					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes, prompt, streamPrimed)
 					return
 				}
 			}
@@ -1066,58 +1155,17 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return
 		}
 	}
-	answerPrompt := prompt + "\n" + ledger.RouterContext() + "\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed."
+	answerPrompt := buildAnswerPrompt(prompt, ledger, len(toolMaps) > 0)
 	answerReq := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments}
-	var res chathub.Result
-	streamed := false
-	if body.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "stream unsupported", http.StatusInternalServerError)
-			return
-		}
-		id := "chatcmpl-" + uuid.NewString()
-		model := firstNonEmpty(body.Model, "m365-copilot")
-		firstDelta := true
-		emit := func(content string) error {
-			delta := map[string]any{"content": content}
-			if firstDelta {
-				firstDelta = false
-				delta = map[string]any{"content": nil, "reasoning_content": "正在分析请求并准备回答……"}
-			}
-			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}}
-			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
-			flusher.Flush()
-			streamed = true
-			return nil
-		}
-		// Commit headers immediately; the first upstream delta is then forwarded
-		// without waiting for the full ChatHub completion frame.
-		fmt.Fprintf(w, ": connected\n\n")
-		flusher.Flush()
-		res, err = s.chat.ChatWithDelta(ctx, account, answerReq, emit)
-		if err == nil {
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
-		}
-	} else {
-		res, err = s.chat.Chat(ctx, account, answerReq)
-	}
+	res, err := s.chat.Chat(ctx, account, answerReq)
 	if err != nil {
-		if streamed {
-			return
-		}
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	if body.Stream {
-		return
-	}
 
+	if poolKey != "" && res.ConversationID != "" {
+		s.convPool.record(poolKey, pooledConversation{AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID})
+	}
 	if body.SessionKey != "" {
 		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 	}
@@ -1128,46 +1176,18 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	id := "chatcmpl-" + uuid.NewString()
 	if calls := fencedToolCalls(res.Text, toolMaps, body.ToolChoice); len(calls) > 0 {
 		calls = limitToolCalls(calls, configuredToolCallLimit(s.settings))
-		_ = writeToolResponse(w, id, model, body.Stream, calls, res)
+		_ = writeToolResponse(w, id, model, body.Stream, calls, res, prompt)
 		return
 	}
 	if calls := nativeToolCalls(res.Events, body.Tools); len(calls) > 0 {
 		calls = limitToolCalls(calls, configuredToolCallLimit(s.settings))
-		_ = writeToolResponse(w, id, model, body.Stream, calls, res)
+		_ = writeToolResponse(w, id, model, body.Stream, calls, res, prompt)
 		return
 	}
 	if !completionEvidenceAllows(res.Text, ledger) {
 		res.Text = "I cannot confirm completion because no matching tool results were returned. No external action has been verified."
 	}
 	created := time.Now().Unix()
-
-	if body.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "stream unsupported", http.StatusInternalServerError)
-			return
-		}
-		// one-shot "stream" — emit full content then done
-		chunk := map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index": 0,
-				"delta": map[string]any{"role": "assistant", "content": res.Text},
-			}},
-		}
-		b, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", b)
-		flusher.Flush()
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
-	}
 
 	content := any(res.Text)
 	if len(res.Images) > 0 {
@@ -1190,7 +1210,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			},
 			"finish_reason": "stop",
 		}},
-		"m365": compatM365Metadata(res),
+		"usage": openAIUsage(prompt, res.Text),
+		"m365":  compatM365Metadata(res),
 	})
 }
 

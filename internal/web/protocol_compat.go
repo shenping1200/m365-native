@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"m365-native/internal/chathub"
 )
@@ -68,7 +69,15 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				if role == "" {
 					role = "user"
 				}
-				o.Messages = append(o.Messages, oaiMsg{Role: role, Content: m["content"]})
+				// Responses API content items (input_text/input_image/
+				// input_file/input_audio) carry their payload directly on the
+				// item instead of a nested content array. Wrap the item so
+				// parseContent can extract text and attachments.
+				content := m["content"]
+				if content == nil {
+					content = []any{m}
+				}
+				o.Messages = append(o.Messages, oaiMsg{Role: role, Content: content})
 			}
 		}
 	default:
@@ -94,18 +103,31 @@ type anthropicTool struct {
 	Description string         `json:"description,omitempty"`
 	InputSchema map[string]any `json:"input_schema"`
 }
+type anthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens *int   `json:"budget_tokens,omitempty"`
+}
+type anthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
 type anthropicRequest struct {
-	Model      string             `json:"model"`
-	System     any                `json:"system,omitempty"`
-	Messages   []anthropicMessage `json:"messages"`
-	Tools      []anthropicTool    `json:"tools,omitempty"`
-	ToolChoice any                `json:"tool_choice,omitempty"`
-	Stream     bool               `json:"stream,omitempty"`
-	MaxTokens  int                `json:"max_tokens,omitempty"`
+	Model        string                 `json:"model"`
+	System       any                    `json:"system,omitempty"`
+	Messages     []anthropicMessage     `json:"messages"`
+	Tools        []anthropicTool        `json:"tools,omitempty"`
+	ToolChoice   any                    `json:"tool_choice,omitempty"`
+	Stream       bool                   `json:"stream,omitempty"`
+	MaxTokens    int                    `json:"max_tokens,omitempty"`
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
 }
 
 func (r anthropicRequest) openAI() (oaiReq, error) {
 	o := oaiReq{Model: r.Model, Stream: r.Stream}
+	if effort, ok := r.thinkingEffort(); ok {
+		o.ReasoningEffort = effort
+		o.Reasoning = &reasoningConfig{Effort: effort}
+	}
 	if r.System != nil {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: r.System})
 	}
@@ -129,6 +151,26 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 			switch typ {
 			case "text":
 				text = append(text, b)
+			case "image":
+				// Anthropic image blocks must not be silently dropped: forward
+				// url or base64 sources as ChatHub attachments.
+				if srcm, ok := b["source"].(map[string]any); ok {
+					st, _ := srcm["type"].(string)
+					switch st {
+					case "url":
+						if u, _ := srcm["url"].(string); u != "" {
+							o.Attachments = append(o.Attachments, chathub.Attachment{Type: "image", URL: u, MimeType: "image/*"})
+						}
+					case "base64":
+						mt, _ := srcm["media_type"].(string)
+						if mt == "" {
+							mt = "image/png"
+						}
+						if data, _ := srcm["data"].(string); data != "" {
+							o.Attachments = append(o.Attachments, chathub.Attachment{Type: "image", URL: "data:" + mt + ";base64," + data, MimeType: mt})
+						}
+					}
+				}
 			case "tool_use":
 				calls = append(calls, map[string]any{"id": b["id"], "type": "function", "function": map[string]any{"name": b["name"], "arguments": mustJSON(b["input"])}})
 			case "tool_result":
@@ -158,4 +200,36 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 		}
 	}
 	return o, nil
+}
+
+// thinkingEffort maps the Anthropic thinking/output_config blocks that
+// new-api and other OpenAI-compatible relays send after converting
+// reasoning_effort. The gateway previously ignored these fields entirely,
+// which silently downgraded every effort-annotated request to the base tone.
+func (r anthropicRequest) thinkingEffort() (string, bool) {
+	if r.OutputConfig != nil && strings.TrimSpace(r.OutputConfig.Effort) != "" {
+		return r.OutputConfig.Effort, true
+	}
+	if r.Thinking == nil {
+		return "", false
+	}
+	switch strings.TrimSpace(r.Thinking.Type) {
+	case "enabled":
+		if r.Thinking.BudgetTokens != nil {
+			switch {
+			case *r.Thinking.BudgetTokens <= 1600:
+				return "low", true
+			case *r.Thinking.BudgetTokens <= 3200:
+				return "medium", true
+			default:
+				return "high", true
+			}
+		}
+		return "medium", true
+	case "adaptive":
+		// Adaptive reasoning without an explicit effort still requires the
+		// reasoning tone, so clients see thinking content in the stream.
+		return "high", true
+	}
+	return "", false
 }

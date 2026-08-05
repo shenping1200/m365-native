@@ -171,6 +171,11 @@ func completionEvidenceAllows(answer string, l agentLedger) bool {
 	if len(l.Completed) > 0 {
 		return true
 	}
+	// Pure conversational turns (no tools involved) must not be rewritten even
+	// if the model happens to use words like "completed" or "started".
+	if l.ToolRounds == 0 {
+		return true
+	}
 	if !unsupportedSuccess.MatchString(answer) {
 		return true
 	}

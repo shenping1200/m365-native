@@ -73,10 +73,17 @@ func toolPlanSummaryFromMaps(calls []any) string {
 	return toolPlanSummary(converted)
 }
 
-func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, preambleSent ...bool) error {
+func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, prompt string, preambleSent ...bool) error {
 	toolCalls := toolCallMaps(calls)
 	summary := toolPlanSummary(calls)
 	msg := map[string]any{"role": "assistant", "content": summary, "reasoning_content": summary, "tool_calls": toolCalls}
+	// Estimate output usage from the tool plan text plus every call's arguments
+	// so tool turns are never billed at zero output tokens.
+	var outText strings.Builder
+	outText.WriteString(summary)
+	for _, tc := range calls {
+		outText.Write(tc.Arguments)
+	}
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -98,9 +105,10 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, cal
 			emit(base(map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": tc.ID, "type": "function", "function": map[string]any{"name": tc.Name, "arguments": string(tc.Arguments)}}}}, nil))
 		}
 		emit(base(map[string]any{}, "tool_calls"))
+		emit(map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{}, "usage": openAIUsage(prompt, outText.String())})
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		return nil
 	}
-	jsonOut(w, map[string]any{"id": id, "object": "chat.completion", "model": model, "choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": "tool_calls"}}, "m365": compatM365Metadata(res)})
+	jsonOut(w, map[string]any{"id": id, "object": "chat.completion", "model": model, "choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": "tool_calls"}}, "usage": openAIUsage(prompt, outText.String()), "m365": compatM365Metadata(res)})
 	return nil
 }

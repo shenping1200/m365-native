@@ -14,7 +14,7 @@ func TestCompatMetadataHidesEventsByDefault(t *testing.T) {
 	if _, ok := m["events"]; ok {
 		t.Fatal("upstream events exposed by default")
 	}
-	if m["conversationId"] != "conv" || m["usage_source"] != "unavailable_from_chathub" {
+	if m["conversationId"] != "conv" || m["usage_source"] != "estimated_by_gateway" {
 		t.Fatalf("metadata=%#v", m)
 	}
 }

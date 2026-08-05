@@ -34,6 +34,9 @@ type Store struct {
 	mu   sync.Mutex
 	path string
 	data Cache
+	// refreshBackoff remembers failed refresh attempts so a broken account is
+	// not hammered by the OAuth token endpoint on every request.
+	refreshBackoff map[string]time.Time
 }
 
 func CachePath() string {
@@ -54,7 +57,7 @@ func OpenStore(path string) (*Store, error) {
 	if path == "" {
 		path = CachePath()
 	}
-	s := &Store{path: path, data: Cache{Accounts: []AccountToken{}}}
+	s := &Store{path: path, data: Cache{Accounts: []AccountToken{}}, refreshBackoff: map[string]time.Time{}}
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return s, nil
@@ -130,20 +133,20 @@ func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 	found := false
 	for i, existing := range s.data.Accounts {
 		if existing.ID == acc.ID || (acc.Email != "" && existing.Email == acc.Email) {
-		if acc.RefreshToken == "" {
-			acc.RefreshToken = existing.RefreshToken
-		}
-		if acc.TID == "" {
-			acc.TID = existing.TID
-		}
-		if acc.OID == "" {
-			acc.OID = existing.OID
-		}
-		// OAuth 登录流程不带 proxy, 保留用户在 Web 界面手动设置的代理
-		if acc.Proxy == "" {
-			acc.Proxy = existing.Proxy
-		}
-		s.data.Accounts[i] = acc
+			if acc.RefreshToken == "" {
+				acc.RefreshToken = existing.RefreshToken
+			}
+			if acc.TID == "" {
+				acc.TID = existing.TID
+			}
+			if acc.OID == "" {
+				acc.OID = existing.OID
+			}
+			// OAuth 登录流程不带 proxy, 保留用户在 Web 界面手动设置的代理
+			if acc.Proxy == "" {
+				acc.Proxy = existing.Proxy
+			}
+			s.data.Accounts[i] = acc
 			found = true
 			break
 		}
@@ -220,12 +223,21 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 		s.mu.Unlock()
 		return acc, fmtExpired()
 	}
+	s.mu.Lock()
+	backoffUntil := s.refreshBackoff[acc.ID]
+	s.mu.Unlock()
+	if !backoffUntil.IsZero() && time.Now().Before(backoffUntil) {
+		return acc, fmtExpired()
+	}
 	client, err := proxy.HTTPClientFor(acc.Proxy)
 	if err != nil {
 		return acc, err
 	}
 	tok, err := Refresh(acc.RefreshToken, client)
 	if err != nil {
+		s.mu.Lock()
+		s.refreshBackoff[acc.ID] = time.Now().Add(2 * time.Minute)
+		s.mu.Unlock()
 		acc.Status = "expired"
 		s.mu.Lock()
 		for i, a := range s.data.Accounts {
@@ -238,6 +250,9 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 		s.mu.Unlock()
 		return acc, err
 	}
+	s.mu.Lock()
+	delete(s.refreshBackoff, acc.ID)
+	s.mu.Unlock()
 	if tok.Email == "" {
 		tok.Email = acc.Email
 	}
@@ -251,6 +266,26 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 		tok.TenantID = acc.TID
 	}
 	return s.Upsert(tok)
+}
+
+// RefreshExpiring refreshes every cached account whose access token expires
+// within minTTL (or is already expired), respecting the per-account refresh
+// backoff. It returns how many accounts were refreshed and how many failed.
+func (s *Store) RefreshExpiring(minTTL time.Duration) (refreshed int, failed int) {
+	for _, acc := range s.List() {
+		if acc.RefreshToken == "" {
+			continue
+		}
+		if time.Now().Before(acc.ExpiresAt.Add(-minTTL)) {
+			continue
+		}
+		if _, err := s.EnsureValid(acc.ID); err != nil {
+			failed++
+			continue
+		}
+		refreshed++
+	}
+	return refreshed, failed
 }
 
 func fmtExpired() error {
