@@ -31,9 +31,20 @@ type Cache struct {
 }
 
 type Store struct {
-	mu   sync.Mutex
-	path string
-	data Cache
+	mu       sync.Mutex
+	path     string
+	data     Cache
+	inflight map[string]*inflightRefresh
+}
+
+// inflightRefresh coalesces concurrent EnsureValid refreshes for the same
+// account: an AAD refresh token can only be redeemed once, so a stampede of
+// concurrent requests must not each call Refresh(). Waiters block on the shared
+// flight and receive the winner's outcome.
+type inflightRefresh struct {
+	done chan struct{}
+	acc  AccountToken
+	err  error
 }
 
 func CachePath() string {
@@ -93,7 +104,17 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, b, 0o600)
+	return atomicWrite(s.path, b, 0o600)
+}
+
+// atomicWrite writes to a temp file then renames, so a crash mid-write never
+// leaves a truncated token cache that would force every account to re-auth.
+func atomicWrite(path string, b []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (s *Store) List() []AccountToken {
@@ -220,8 +241,34 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 		s.mu.Unlock()
 		return acc, fmtExpired()
 	}
+	return s.refreshInflight(acc)
+}
+
+// refreshInflight runs the AAD token refresh exactly once per account; waiters
+// block on the shared flight instead of each redeeming the one-time refresh
+// token (which would otherwise fail a concurrent stampede with 401s). The
+// winner's outcome is broadcast to all waiters.
+func (s *Store) refreshInflight(acc AccountToken) (AccountToken, error) {
+	s.mu.Lock()
+	if s.inflight == nil {
+		s.inflight = map[string]*inflightRefresh{}
+	}
+	if f, ok := s.inflight[acc.ID]; ok {
+		s.mu.Unlock()
+		<-f.done
+		return f.acc, f.err
+	}
+	f := &inflightRefresh{done: make(chan struct{})}
+	s.inflight[acc.ID] = f
+	s.mu.Unlock()
+
 	client, err := proxy.HTTPClientFor(acc.Proxy)
 	if err != nil {
+		f.acc, f.err = acc, err
+		close(f.done)
+		s.mu.Lock()
+		delete(s.inflight, acc.ID)
+		s.mu.Unlock()
 		return acc, err
 	}
 	tok, err := Refresh(acc.RefreshToken, client)
@@ -235,6 +282,11 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 				break
 			}
 		}
+		s.mu.Unlock()
+		f.acc, f.err = acc, err
+		close(f.done)
+		s.mu.Lock()
+		delete(s.inflight, acc.ID)
 		s.mu.Unlock()
 		return acc, err
 	}
@@ -250,7 +302,12 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 	if tok.TenantID == "" {
 		tok.TenantID = acc.TID
 	}
-	return s.Upsert(tok)
+	f.acc, f.err = s.Upsert(tok)
+	close(f.done)
+	s.mu.Lock()
+	delete(s.inflight, acc.ID)
+	s.mu.Unlock()
+	return f.acc, f.err
 }
 
 func fmtExpired() error {

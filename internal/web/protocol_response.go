@@ -44,12 +44,8 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	f, _ := w.(http.Flusher)
 	emit := func(name string, v any) {
-		writeSSE(w, name, v)
-		if f != nil {
-			f.Flush()
-		}
+		_ = writeSSE(w, name, v)
 	}
 	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
 	for i, item := range output {
@@ -110,12 +106,8 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	f, _ := w.(http.Flusher)
 	emit := func(n string, v any) {
-		writeSSE(w, n, v)
-		if f != nil {
-			f.Flush()
-		}
+		_ = writeSSE(w, n, v)
 	}
 	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
 	for i, b := range blocks {

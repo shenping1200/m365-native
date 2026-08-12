@@ -166,12 +166,13 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 
 	var deltas []string
-	var streamedText string
+	var streamed strings.Builder
 	emitDelta := func(d string) error {
 		if d == "" {
 			return nil
 		}
-		streamedText += d
+		streamed.WriteString(d)
+		deltas = append(deltas, d)
 		if onDelta != nil {
 			return onDelta(d)
 		}
@@ -181,8 +182,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if snapshot == "" {
 			return nil
 		}
-		if streamedText != "" && strings.HasPrefix(snapshot, streamedText) {
-			return emitDelta(strings.TrimPrefix(snapshot, streamedText))
+		cur := streamed.String()
+		if cur != "" && strings.HasPrefix(snapshot, cur) {
+			return emitDelta(strings.TrimPrefix(snapshot, cur))
+		}
+		if i := strings.Index(snapshot, cur); i >= 0 {
+			return emitDelta(snapshot[i+len(cur):])
 		}
 		return emitDelta(snapshot)
 	}

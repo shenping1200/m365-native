@@ -845,6 +845,24 @@ func normalizeLegacyTools(body *oaiReq) {
 	}
 }
 
+// sseRaw writes one SSE frame and flushes; a write error (client gone,
+// deadline exceeded) or a canceled request context aborts the stream
+// instead of blocking a goroutine against a dead/slow socket.
+func sseRaw(ctx context.Context, w http.ResponseWriter, f http.Flusher, payload string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if _, err := fmt.Fprint(w, payload); err != nil {
+		return err
+	}
+	if f != nil {
+		f.Flush()
+	}
+	return nil
+}
+
 func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -981,8 +999,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		fmt.Fprintf(w, ": connected\n\n")
-		flusher.Flush()
+		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
+			return
+		}
 		first := true
 		var streamedTools []detectedToolCall
 		_, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
@@ -999,18 +1018,21 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				first = false
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
-			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
-			flusher.Flush()
+			if err := sseRaw(r.Context(), w, flusher, "data: "+mustJSON(chunk)+"\n\n"); err != nil {
+				return err
+			}
 			return nil
 		})
 		if err == nil {
 			for i, tc := range streamedTools {
 				chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": tc.ID, "type": "function", "function": map[string]any{"name": tc.Name, "arguments": string(tc.Arguments)}}}}, "finish_reason": nil}}}
-				fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
-				flusher.Flush()
+				if err := sseRaw(r.Context(), w, flusher, "data: "+mustJSON(chunk)+"\n\n"); err != nil {
+					return
+				}
 			}
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			if err := sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n"); err != nil {
+				return
+			}
 		}
 		return
 	}
@@ -1090,19 +1112,22 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				delta = map[string]any{"content": nil, "reasoning_content": "正在分析请求并准备回答……"}
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}}
-			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
-			flusher.Flush()
+			if err := sseRaw(r.Context(), w, flusher, "data: "+mustJSON(chunk)+"\n\n"); err != nil {
+				return err
+			}
 			streamed = true
 			return nil
 		}
 		// Commit headers immediately; the first upstream delta is then forwarded
 		// without waiting for the full ChatHub completion frame.
-		fmt.Fprintf(w, ": connected\n\n")
-		flusher.Flush()
+		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
+			return
+		}
 		res, err = s.chat.ChatWithDelta(ctx, account, answerReq, emit)
 		if err == nil {
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			if err := sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n"); err != nil {
+				return
+			}
 		}
 	} else {
 		res, err = s.chat.Chat(ctx, account, answerReq)
@@ -1162,10 +1187,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}},
 		}
 		b, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", b)
-		flusher.Flush()
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		if err := sseRaw(r.Context(), w, flusher, "data: "+string(b)+"\n\n"); err != nil {
+			return
+		}
+		if err := sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n"); err != nil {
+			return
+		}
 		return
 	}
 

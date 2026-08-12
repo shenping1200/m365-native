@@ -64,8 +64,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		http.Error(w, "stream unsupported", http.StatusInternalServerError)
 		return
 	}
@@ -78,22 +77,37 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 			"sessionId":      res.SessionID,
 			"requestId":      res.RequestID,
 		}
-		writeSSE(w, "event", payload)
-		flusher.Flush()
+		if err := writeSSE(w, "event", payload); err != nil {
+			return
+		}
 	}
 	for i, event := range chathub.SemanticEvents(res.Events) {
-		writeSSE(w, "semantic", map[string]any{"index": i, "type": "m365.semantic", "event": event})
-		flusher.Flush()
+		if err := writeSSE(w, "semantic", map[string]any{"index": i, "type": "m365.semantic", "event": event}); err != nil {
+			return
+		}
 	}
-	writeSSE(w, "done", map[string]any{
+	if err := writeSSE(w, "done", map[string]any{
 		"type": "done", "text": res.Text,
 		"conversationId": res.ConversationID, "sessionId": res.SessionID, "requestId": res.RequestID,
 		"throttling": res.Throttling,
-	})
-	flusher.Flush()
+	}); err != nil {
+		return
+	}
 }
 
-func writeSSE(w http.ResponseWriter, name string, value any) {
+// writeSSE emits one SSE frame and flushes; a write error (client gone, deadline
+// exceeded) is returned so the caller can abort instead of blocking a goroutine
+// against a dead socket. A per-write deadline bounds how long a slow client can
+// stall the handler.
+func writeSSE(w http.ResponseWriter, name string, value any) error {
 	b, _ := json.Marshal(value)
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b)
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b); err != nil {
+		return err
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
 }
