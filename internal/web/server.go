@@ -284,19 +284,24 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	}
 	list := s.tokens.List()
 	type view struct {
-		ID           string    `json:"id"`
-		Email        string    `json:"email"`
-		DisplayName  string    `json:"displayName,omitempty"`
-		Status       string    `json:"status"`
-		OID          string    `json:"oid,omitempty"`
-		TID          string    `json:"tid,omitempty"`
-		ExpiresAt    time.Time `json:"expiresAt,omitempty"`
-		UpdatedAt    time.Time `json:"updatedAt,omitempty"`
-		RequestCount int64     `json:"requestCount"`
-		Proxy        string    `json:"proxy,omitempty"`
+		ID           string            `json:"id"`
+		Email        string            `json:"email"`
+		DisplayName  string            `json:"displayName,omitempty"`
+		Status       string            `json:"status"`
+		OID          string            `json:"oid,omitempty"`
+		TID          string            `json:"tid,omitempty"`
+		ExpiresAt    time.Time         `json:"expiresAt,omitempty"`
+		UpdatedAt    time.Time         `json:"updatedAt,omitempty"`
+		RequestCount int64             `json:"requestCount"`
+		Proxy        string            `json:"proxy,omitempty"`
+		Health       accountHealthView `json:"health,omitempty"`
 	}
 	out := make([]view, 0, len(list))
 	var total int64
+	healthMap := make(map[string]accountHealthView)
+	for _, hv := range s.healthPool().Snapshot() {
+		healthMap[hv.AccountID] = hv
+	}
 	s.mu.Lock()
 	for _, a := range list {
 		cnt := s.accountStats[a.ID]
@@ -307,6 +312,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
 			RequestCount: cnt,
 			Proxy:        a.Proxy,
+			Health:       healthMap[a.ID],
 		})
 	}
 	s.mu.Unlock()
