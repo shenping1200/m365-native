@@ -27,7 +27,7 @@ type pendingPKCE struct {
 
 type Server struct {
 	mu                 sync.Mutex
-	accountIdx        int
+	accountIdx         int
 	tokens             *auth.Store
 	pkce               map[string]pendingPKCE
 	chat               *chathub.Client
@@ -40,6 +40,8 @@ type Server struct {
 	debug              *debugStore
 	settings           *settingsStore
 	accountStats       map[string]int64
+	accountPool        *accountHealth
+	accountPoolOnce    sync.Once
 }
 
 func New() (*Server, error) {
@@ -527,10 +529,10 @@ func (s *Server) testAllProxies(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	jsonOut(w, map[string]any{
-		"results":  results,
-		"total":    len(results),
-		"ok":       okCount,
-		"failed":   len(results) - okCount,
+		"results": results,
+		"total":   len(results),
+		"ok":      okCount,
+		"failed":  len(results) - okCount,
 	})
 }
 
@@ -627,9 +629,13 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 	start := s.accountIdx % len(list)
 	s.accountIdx++
 	s.mu.Unlock()
+	pool := s.healthPool()
 	var lastErr error
 	for i := 0; i < len(list); i++ {
 		acc := list[(start+i)%len(list)]
+		if !pool.Available(acc.ID) {
+			continue
+		}
 		tok, err := s.tokens.EnsureValid(acc.ID)
 		if err == nil {
 			s.mu.Lock()
@@ -736,21 +742,33 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
-	res, err := s.chat.Chat(ctx, chathub.Account{
-		AccessToken: acc.AccessToken,
-		OID:         acc.OID,
-		TID:         acc.TID,
-		Proxy:       acc.Proxy,
-	}, chathub.Request{
+	req := chathub.Request{
 		Text:           text,
 		Tone:           body.Tone,
 		ConversationID: body.ConversationID,
 		SessionID:      body.SessionID,
 		Attachments:    body.Attachments,
-	})
+	}
+	account := chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID, Proxy: acc.Proxy}
+	res, err := s.chat.Chat(ctx, account, req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+		if body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) {
+			if next, nerr := s.nextHealthyAccount(acc.ID); nerr == nil {
+				s.markAccountResult(acc.ID, err)
+				acc = next
+				account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID, Proxy: acc.Proxy}
+				res, err = s.chat.Chat(ctx, account, req)
+			}
+		}
+		if err != nil {
+			s.markAccountResult(acc.ID, err)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
+	s.markAccountResult(acc.ID, nil)
+	if res.Throttling != nil {
+		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}
 	if body.SessionKey != "" {
 		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
@@ -1133,11 +1151,39 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		res, err = s.chat.Chat(ctx, account, answerReq)
 	}
 	if err != nil {
+		s.markAccountResult(acc.ID, err)
 		if streamed {
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+		// non-streaming auto-selected chats fail over to the next healthy account once
+		if !body.Stream && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) {
+			if next, nerr := s.nextHealthyAccount(acc.ID); nerr == nil {
+				acc = next
+				account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID, Proxy: acc.Proxy}
+				var rerr error
+				res, rerr = s.chat.Chat(ctx, account, chathub.Request{
+					Text:           answerPrompt,
+					Tone:           tone,
+					ConversationID: body.ConversationID,
+					SessionID:      body.SessionID,
+					Attachments:    body.Attachments,
+				})
+				if rerr == nil {
+					s.markAccountResult(acc.ID, nil)
+					err = nil
+				} else {
+					err = rerr
+				}
+			}
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
+	s.markAccountResult(acc.ID, nil)
+	if res.Throttling != nil {
+		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}
 	if body.Stream {
 		return
@@ -1250,4 +1296,48 @@ func extractOIDTID(accessToken string) (oid, tid string) {
 		tid = v
 	}
 	return oid, tid
+}
+
+// --- per-account 429 failover (D 项) ---
+
+// health returns the per-account health tracker, initializing it once.
+func (s *Server) healthPool() *accountHealth {
+	s.accountPoolOnce.Do(func() { s.accountPool = newAccountHealth() })
+	return s.accountPool
+}
+
+// nextHealthyAccount returns the next available account that is not avoidID and
+// not currently rate-limited or auth-failed.
+func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
+	list := s.tokens.List()
+	pool := s.healthPool()
+	for _, acc := range list {
+		if acc.ID == avoidID {
+			continue
+		}
+		if !pool.Available(acc.ID) {
+			continue
+		}
+		tok, err := s.tokens.EnsureValid(acc.ID)
+		if err == nil {
+			return tok, nil
+		}
+	}
+	return auth.AccountToken{}, fmt.Errorf("no healthy account available")
+}
+
+// markAccountResult updates per-account health from a chat result/error.
+func (s *Server) markAccountResult(id string, err error) {
+	if err == nil {
+		s.healthPool().MarkSuccess(id)
+		return
+	}
+	if IsRateLimited(err) {
+		s.healthPool().MarkRateLimited(id, time.Time{})
+		return
+	}
+	if IsAuthFailure(err) {
+		s.healthPool().MarkAuthFail(id)
+		return
+	}
 }
