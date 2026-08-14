@@ -40,6 +40,8 @@ type Server struct {
 	debug              *debugStore
 	settings           *settingsStore
 	accountStats       map[string]int64
+		accountTokenIn  map[string]int64
+		accountTokenOut map[string]int64
 	accountPool        *accountHealth
 	accountPoolOnce    sync.Once
 }
@@ -63,6 +65,8 @@ func New() (*Server, error) {
 		debug:              openDebugStore(),
 		settings:           openSettingsStore(),
 		accountStats:       make(map[string]int64),
+		accountTokenIn:     make(map[string]int64),
+		accountTokenOut:    make(map[string]int64),
 	}, nil
 }
 
@@ -293,11 +297,14 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt    time.Time         `json:"expiresAt,omitempty"`
 		UpdatedAt    time.Time         `json:"updatedAt,omitempty"`
 		RequestCount int64             `json:"requestCount"`
+		TokenIn  int64 `json:"tokenIn"`
+		TokenOut int64 `json:"tokenOut"`
 		Proxy        string            `json:"proxy,omitempty"`
 		Health       accountHealthView `json:"health,omitempty"`
 	}
 	out := make([]view, 0, len(list))
 	var total int64
+	var totalIn, totalOut int64
 	healthMap := make(map[string]accountHealthView)
 	for _, hv := range s.healthPool().Snapshot() {
 		healthMap[hv.AccountID] = hv
@@ -306,17 +313,23 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	for _, a := range list {
 		cnt := s.accountStats[a.ID]
 		total += cnt
+		tin := s.accountTokenIn[a.ID]
+		tout := s.accountTokenOut[a.ID]
+		totalIn += tin
+		totalOut += tout
 		out = append(out, view{
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
 			RequestCount: cnt,
+			TokenIn:  tin,
+			TokenOut: tout,
 			Proxy:        a.Proxy,
 			Health:       healthMap[a.ID],
 		})
 	}
 	s.mu.Unlock()
-	jsonOut(w, map[string]any{"accounts": out, "totalRequestCount": total})
+	jsonOut(w, map[string]any{"accounts": out, "totalRequestCount": total, "totalTokenIn": totalIn, "totalTokenOut": totalOut})
 }
 
 // accountRequestCount returns the per-account request counter under the server
@@ -326,6 +339,37 @@ func (s *Server) accountRequestCount(id string) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.accountStats[id]
+}
+
+// estimateTokens approximates the token count of a string with a simple
+// heuristic: ~4 ASCII chars per token and ~1 token per non-ASCII (e.g. CJK)
+// character. M365 Copilot does not expose real token usage, so this value is
+// an estimate only and must never be treated as billing-accurate.
+func estimateTokens(s string) int {
+	ascii, other := 0, 0
+	for _, r := range s {
+		if r < 0x80 {
+			ascii++
+		} else {
+			other++
+		}
+	}
+	return (ascii + 3) / 4 + other
+}
+
+// recordTokens estimates and accumulates input/output token usage for an
+// account. It reuses the server mutex that guards the other per-account
+// counters so concurrent requests cannot race on the maps.
+func (s *Server) recordTokens(id, inputText, outputText string) {
+	if id == "" {
+		return
+	}
+	in := estimateTokens(inputText)
+	out := estimateTokens(outputText)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accountTokenIn[id] += int64(in)
+	s.accountTokenOut[id] += int64(out)
 }
 
 func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -773,6 +817,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.markAccountResult(acc.ID, nil)
+	s.recordTokens(acc.ID, text, res.Text)
 	if res.Throttling != nil {
 		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}
@@ -1188,6 +1233,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	s.markAccountResult(acc.ID, nil)
+	s.recordTokens(acc.ID, prompt, res.Text)
 	if res.Throttling != nil {
 		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}
