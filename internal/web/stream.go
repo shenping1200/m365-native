@@ -61,7 +61,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
 	}
 
-	s.recordTokens(acc.ID, text, res.Text)
+	s.recordTokens(acc.ID, text, res.FullText)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")

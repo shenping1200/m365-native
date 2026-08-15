@@ -817,7 +817,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.markAccountResult(acc.ID, nil)
-	s.recordTokens(acc.ID, text, res.Text)
+	s.recordTokens(acc.ID, text, res.FullText)
 	if res.Throttling != nil {
 		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}
@@ -1102,7 +1102,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if err := sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n"); err != nil {
 				return
 			}
-			s.recordTokens(acc.ID, prompt, res2.Text)
+			s.recordTokens(acc.ID, prompt, res2.FullText)
 		}
 		return
 	}
@@ -1234,7 +1234,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	s.markAccountResult(acc.ID, nil)
-	s.recordTokens(acc.ID, prompt, res.Text)
+	s.recordTokens(acc.ID, prompt, res.FullText)
 	if res.Throttling != nil {
 		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}

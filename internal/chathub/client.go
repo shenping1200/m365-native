@@ -58,6 +58,7 @@ type StreamEvent struct {
 type StreamHandler func(StreamEvent) error
 
 type Result struct {
+	FullText       string
 	Text           string
 	ConversationID string
 	SessionID      string
@@ -323,6 +324,19 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				}
 				return Result{
 					Text:           text,
+		FullText:       func() string {
+
+			f := streamed.String()
+
+			if len(text) > len(f) {
+
+				f = text
+
+			}
+
+			return f
+
+		}(),
 					ConversationID: req.ConversationID,
 					SessionID:      req.SessionID,
 					RequestID:      requestID,
