@@ -364,12 +364,23 @@ func (s *Server) recordTokens(id, inputText, outputText string) {
 	if id == "" {
 		return
 	}
-	in := estimateTokens(inputText)
-	out := estimateTokens(outputText)
+	in := int(countTokens("m365-copilot", inputText))
+	out := int(countTokens("m365-copilot", outputText))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.accountTokenIn[id] += int64(in)
 	s.accountTokenOut[id] += int64(out)
+}
+
+// addTokens accumulates a pre-estimated input/output token pair for an account.
+func (s *Server) addTokens(id string, in, out int64) {
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accountTokenIn[id] += in
+	s.accountTokenOut[id] += out
 }
 
 func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -1102,7 +1113,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if err := sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n"); err != nil {
 				return
 			}
-			s.recordTokens(acc.ID, prompt, res2.FullText)
+			in, out := estimateChatUsage(firstNonEmpty(body.Model, "m365-copilot"), body.Messages, body.Tools, res2.FullText)
+			s.addTokens(acc.ID, in, out)
 		}
 		return
 	}
@@ -1234,7 +1246,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	s.markAccountResult(acc.ID, nil)
-	s.recordTokens(acc.ID, prompt, res.FullText)
+	in, out := estimateChatUsage(firstNonEmpty(body.Model, "m365-copilot"), body.Messages, body.Tools, res.FullText)
+	s.addTokens(acc.ID, in, out)
 	if res.Throttling != nil {
 		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}

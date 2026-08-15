@@ -1,10 +1,13 @@
 FROM golang:1.22-alpine AS build
+ENV GOPROXY=https://goproxy.cn,direct
 
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY . .
+RUN go get github.com/tiktoken-go/tokenizer@v0.4.0
 RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/m365-native ./cmd/server
+RUN cp go.sum /out/go.sum
 
 FROM alpine:3.20
 RUN addgroup -S m365 && adduser -S -G m365 m365 \
