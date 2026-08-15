@@ -1073,7 +1073,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		first := true
 		var streamedTools []detectedToolCall
-		_, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
+		res2, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 				streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
 				return nil
@@ -1102,6 +1102,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if err := sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n"); err != nil {
 				return
 			}
+			s.recordTokens(acc.ID, prompt, res2.Text)
 		}
 		return
 	}
